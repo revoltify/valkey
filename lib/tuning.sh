@@ -50,7 +50,7 @@ container_cpus() {
 }
 
 auto_maxmemory() {
-    printf '%s' "$(($(container_memory_bytes) / 100 * VALKEY_MAXMEMORY_PERCENT))"
+    printf '%s' "$(($(container_memory_bytes) * VALKEY_MAXMEMORY_PERCENT / 100))"
 }
 
 auto_io_threads() {
