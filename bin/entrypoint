@@ -1,0 +1,150 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/valkey-backup/common.sh
+. /usr/local/lib/valkey-backup/tuning.sh
+
+VALKEY_CONF=/usr/local/etc/valkey/valkey.conf
+RUNTIME_CONF=/tmp/runtime.conf
+STARTING_MARKER=/tmp/valkey-starting
+AOF_MANIFEST="$DATA_DIR/appendonlydir/appendonly.aof.manifest"
+
+if [ "$(id -u)" = "0" ]; then
+    [ "$(stat -c %U "$DATA_DIR")" = "valkey" ] || chown -R valkey:valkey "$DATA_DIR"
+    chmod 700 "$DATA_DIR"
+    exec su-exec valkey "$0" "$@"
+fi
+
+validate_env() {
+    require_env VALKEY_PASSWORD
+    require_matching VALKEY_PASSWORD '[A-Za-z0-9_-]{32,}' 'VALKEY_PASSWORD must be at least 32 characters of A-Z a-z 0-9 _ -'
+    [ "$(distinct_characters_in "$VALKEY_PASSWORD")" -ge 10 ] || fail "VALKEY_PASSWORD is too predictable, generate one with: openssl rand -hex 32"
+    require_boolean BACKUP_ENABLED
+    require_boolean RESTORE_ON_EMPTY
+    require_integer_at_least VALKEY_MAXMEMORY_PERCENT 1
+    [ "$VALKEY_MAXMEMORY_PERCENT" -le 95 ] || fail "VALKEY_MAXMEMORY_PERCENT must be at most 95"
+    reserved=$(reserved_env_directives | tr '\n' ' ')
+    [ -z "$reserved" ] || fail "managed by the image, cannot be overridden: $reserved"
+    [ "$BACKUP_ENABLED" = "false" ] || validate_backup_env
+}
+
+write_runtime_conf() {
+    tuned=$(tuned_directives)
+    umask 077
+    {
+        printf '%s\n' "$tuned"
+        env_directives
+        printf 'requirepass "%s"\n' "$VALKEY_PASSWORD"
+    } > "$RUNTIME_CONF"
+    log "tuned: $(printf '%s' "$tuned" | tr '\n' ';') overrides: $(env_directives | awk '{ print $1 }' | tr '\n' ' ')"
+}
+
+clean_leftovers() {
+    rm -rf "$DATA_DIR"/temp-*.rdb "$BACKUP_TMP_DIR"/backup.*
+}
+
+aof_is_usable() {
+    [ -s "$AOF_MANIFEST" ] && grep -q ' type b' "$AOF_MANIFEST"
+}
+
+rdb_is_usable() {
+    [ -s "$DATA_DIR/dump.rdb" ]
+}
+
+set_aside_incomplete_aof() {
+    [ -e "$DATA_DIR/appendonlydir" ] || return 0
+    target="$DATA_DIR/appendonlydir.incomplete-$(date -u +%Y%m%dT%H%M%SZ)"
+    mv "$DATA_DIR/appendonlydir" "$target"
+    log "moved AOF without a base file to $target"
+}
+
+restore_from_backup() {
+    [ "$BACKUP_ENABLED" = "true" ] && [ "$RESTORE_ON_EMPTY" = "true" ] || return 1
+    status=0
+    restore-latest || status=$?
+    [ "$status" -eq 0 ] && return 0
+    [ "$status" -eq 2 ] && return 1
+    fail "restore failed, refusing to start with empty data"
+}
+
+boot_mode() {
+    aof_is_usable && { printf 'aof'; return; }
+    set_aside_incomplete_aof
+    rdb_is_usable && { printf 'rdb'; return; }
+    restore_from_backup && { printf 'rdb'; return; }
+    printf 'empty'
+}
+
+wait_for_valkey() {
+    until valkey_ping; do
+        sleep 1
+    done
+}
+
+aof_rewrite_running() {
+    [ "$(persistence_field aof_rewrite_in_progress)" = "1" ] || [ "$(persistence_field aof_rewrite_scheduled)" = "1" ]
+}
+
+enable_aof() {
+    reply=$(valkey-cli CONFIG SET appendonly yes 2>&1)
+    [ "$reply" = "OK" ] || { log "ERROR: could not enable AOF: $reply"; return 1; }
+    while aof_rewrite_running; do
+        sleep 1
+    done
+    [ "$(persistence_field aof_last_bgrewrite_status)" = "ok" ] || { log "ERROR: AOF rebuild failed, check valkey logs"; return 1; }
+    log "AOF rebuilt from dump.rdb"
+}
+
+seconds_since_latest_backup() {
+    latest=$(backup_names | tail -n 1)
+    [ -n "$latest" ] || return 1
+    printf '%s' "$(($(date -u +%s) - $(backup_epoch "$latest")))"
+}
+
+next_backup_delay() {
+    age=$(seconds_since_latest_backup) || { printf '0'; return; }
+    delay=$((BACKUP_INTERVAL_SECONDS - age))
+    [ "$delay" -gt 0 ] && printf '%s' "$delay" || printf '0'
+}
+
+backup_loop() {
+    floor=$BACKUP_RETRY_SECONDS
+    [ "$floor" -gt "$BACKUP_INTERVAL_SECONDS" ] && floor=$BACKUP_INTERVAL_SECONDS
+    delay=$(next_backup_delay)
+    while true; do
+        log "next backup in ${delay}s"
+        sleep "$delay"
+        backup || log "ERROR: backup failed"
+        delay=$(next_backup_delay)
+        [ "$delay" -lt "$floor" ] && delay=$floor
+    done
+}
+
+after_start() {
+    wait_for_valkey
+    rm -f "$RUNTIME_CONF" "$STARTING_MARKER"
+    if [ "$1" = "rdb" ]; then
+        enable_aof || log "ERROR: running without AOF until next restart"
+    fi
+    if [ "$BACKUP_ENABLED" = "true" ]; then
+        backup_loop
+    fi
+}
+
+main() {
+    touch "$STARTING_MARKER"
+    validate_env
+    write_runtime_conf
+    clean_leftovers
+
+    mode=$(boot_mode)
+    log "boot mode: $mode"
+
+    set -- "$VALKEY_CONF" --include "$RUNTIME_CONF"
+    [ "$mode" = "rdb" ] && set -- "$@" --appendonly no
+
+    (set +e; after_start "$mode" &)
+    exec valkey-server "$@"
+}
+
+main

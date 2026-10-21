@@ -1,0 +1,89 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/valkey-backup/common.sh
+
+LOCK_FILE="$BACKUP_TMP_DIR/backup.lock"
+
+acquire_lock() {
+    exec 9> "$LOCK_FILE"
+    flock -n 9 || fail "another backup is already running"
+}
+
+require_within_timeout() {
+    [ "$(($(date -u +%s) - started))" -lt "$BACKUP_SNAPSHOT_TIMEOUT" ] || fail "snapshot not finished after ${BACKUP_SNAPSHOT_TIMEOUT}s"
+}
+
+wait_for_snapshot_idle() {
+    until [ "$(persistence_field rdb_bgsave_in_progress)" = "0" ]; do
+        require_within_timeout
+        sleep 1
+    done
+}
+
+request_snapshot() {
+    while true; do
+        wait_for_snapshot_idle
+        saves_before=$(persistence_field rdb_saves)
+        reply=$(valkey-cli BGSAVE SCHEDULE 2>&1)
+        case "$reply" in
+            "Background saving started" | "Background saving scheduled") return 0 ;;
+        esac
+        log "BGSAVE not accepted yet: $reply"
+        require_within_timeout
+        sleep 1
+    done
+}
+
+wait_for_own_snapshot() {
+    until [ "$(persistence_field rdb_saves)" -gt "$saves_before" ] && [ "$(persistence_field rdb_bgsave_in_progress)" = "0" ]; do
+        require_within_timeout
+        sleep 1
+    done
+    [ "$(persistence_field rdb_last_bgsave_status)" = "ok" ] || fail "BGSAVE failed, check valkey logs"
+}
+
+require_space_for() {
+    needed_kb=$(($(size_of "$1") / 1024 + 1))
+    available_kb=$(df -Pk "$BACKUP_TMP_DIR" | awk 'NR == 2 { print $4 }')
+    [ "$available_kb" -gt "$needed_kb" ] || fail "not enough space in $BACKUP_TMP_DIR: need ${needed_kb}KB, have ${available_kb}KB"
+}
+
+all_but_newest() {
+    awk -v keep="$1" '{ names[NR] = $0 } END { for (i = 1; i <= NR - keep; i++) print names[i] }'
+}
+
+prune_old_backups() {
+    backups=$(backup_names) || fail "cannot list backups for pruning"
+    for name in $(printf '%s\n' "$backups" | all_but_newest "$BACKUP_RETENTION"); do
+        s3_delete "$name" || fail "could not delete $name"
+        log "pruned $name"
+    done
+}
+
+main() {
+    validate_backup_env
+    acquire_lock
+
+    keys=$(total_keys)
+    if [ "$keys" -eq 0 ]; then
+        log "dataset is empty, skipping upload so existing backups are kept"
+        return 0
+    fi
+
+    started=$(date -u +%s)
+    request_snapshot
+    wait_for_own_snapshot
+
+    name="dump-$(date -u +%Y%m%dT%H%M%SZ).rdb.gz"
+    workdir=$(mktemp -d "$BACKUP_TMP_DIR/backup.XXXXXX")
+    trap 'rm -rf "$workdir"' EXIT
+
+    require_space_for "$DATA_DIR/dump.rdb"
+    gzip -c "$DATA_DIR/dump.rdb" > "$workdir/$name"
+    s3_upload "$workdir/$name" "$name" || fail "upload of $name failed"
+    log "uploaded $name ($(du -h "$workdir/$name" | cut -f 1), $keys keys)"
+    prune_old_backups
+}
+
+main

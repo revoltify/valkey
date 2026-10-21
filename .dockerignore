@@ -1,0 +1,4 @@
+*
+!valkey.conf
+!lib/
+!bin/
