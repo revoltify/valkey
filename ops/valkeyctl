@@ -9,7 +9,8 @@ STATE_DIR=${VALKEYCTL_HOME:-$HOME/.valkeyctl}
 CLUSTERS_DIR=${VALKEYCTL_CLUSTERS_DIR:-$STATE_DIR/clusters}
 DEFAULT_IMAGE=ghcr.io/revoltify/valkey:latest
 REMOTE_DIR=/srv/valkey
-NODE_ENV_PASSTHROUGH='^(S3_[A-Z_]+|BACKUP_[A-Z_]+|RESTORE_[A-Z_]+|TLS_CLIENT_VERIFY|VALKEY_MAXMEMORY_PERCENT)$'
+NODE_ENV_PASSTHROUGH='^(S3_[A-Z_]+|BACKUP_[A-Z_]+|RESTORE_[A-Z_]+|ACME_[A-Z_]+|CF_DNS_API_TOKEN|TLS_CLIENT_VERIFY|VALKEY_MAXMEMORY_PERCENT)$'
+ACME_WAIT_SECONDS=240
 IPV4='([0-9]{1,3}\.){3}[0-9]{1,3}'
 FAILOVER_TEST_SETTLE_SECONDS=10
 FAILOVER_MINIMUM_NODES=3
@@ -21,6 +22,8 @@ TLS_LOCAL_DIR=
 EXIT_HOOKS=
 SCRATCH=
 CLIENT_CERT_VARS=()
+ANSWER=
+INVENTORY_TEXT=
 
 usage() {
     cat <<'EOF'
@@ -38,6 +41,7 @@ usage: valkeyctl [--yes] <command> <cluster> [arguments]
   test-failover <cluster>                          stop the primary under write load and measure the impact
   backup-now <cluster>                             run the image's backup on the current primary
 
+  domain <cluster>                                 serve a Let's Encrypt certificate for your domain (Cloudflare DNS)
   list                                             clusters known on this machine
   env <cluster>                                    Laravel .env lines (host, password, certificates as base64)
   certs <cluster> [dir]                            copy ca.crt, client.crt and client.key (default: current directory)
@@ -317,7 +321,7 @@ tls_cli() {
     local dir=$1
     shift
     docker run --rm --network host --env-file "$VALKEY_DIR/.env" -v "$dir:/client:ro" --entrypoint sh "$(image_in_use)" \
-        -c 'VALKEYCLI_AUTH=$VALKEY_PASSWORD exec valkey-cli --tls --cacert /client/ca.crt --cert /client/client.crt --key /client/client.key "$@"' \
+        -c 'cat /client/ca.crt /etc/ssl/cert.pem > /tmp/trusted.pem; VALKEYCLI_AUTH=$VALKEY_PASSWORD exec valkey-cli --tls --cacert /tmp/trusted.pem --cert /client/client.crt --key /client/client.key "$@"' \
         valkey-cli "$@" </dev/null 2>&1 | tr -d '\r'
 }
 recreate_endpoints() {
@@ -348,6 +352,8 @@ run_on() {
 
 load_client_cert_vars() {
     CLIENT_CERT_VARS=()
+ANSWER=
+INVENTORY_TEXT=
     [ -s "$TLS_LOCAL_DIR/client.key" ] || return 0
     CLIENT_CERT_VARS=("CA_CRT=$(cat "$TLS_LOCAL_DIR/ca.crt")" "CLIENT_CRT=$(cat "$TLS_LOCAL_DIR/client.crt")" "CLIENT_KEY=$(cat "$TLS_LOCAL_DIR/client.key")")
 }
@@ -579,31 +585,28 @@ ensure_password() {
 }
 
 ask() {
-    local prompt=$1 default=${2:-} answer
-    read -r -p "$prompt${default:+ [$default]}: " answer || die "no answer, run init in a terminal"
-    printf '%s' "${answer:-$default}"
+    local prompt=$1 default=${2:-}
+    read -r -p "$prompt${default:+ [$default]}: " ANSWER || die "no answer (input ended), nothing was changed"
+    ANSWER=${ANSWER:-$default}
 }
 
 ask_secret() {
-    local answer
-    read -r -s -p "$1: " answer || die "no answer, run init in a terminal"
+    read -r -s -p "$1: " ANSWER || die "no answer (input ended), nothing was changed"
     printf '\n' >&2
-    printf '%s' "$answer"
 }
 
 ask_valid() {
-    local prompt=$1 default=$2 check=$3 problem=$4 answer
+    local prompt=$1 default=$2 check=$3 problem=$4
     while true; do
-        answer=$(ask "$prompt" "$default")
-        "$check" "$answer" && { printf '%s' "$answer"; return 0; }
+        ask "$prompt" "$default"
+        "$check" "$ANSWER" && return 0
         printf '  %s\n' "$problem" >&2
     done
 }
 
 ask_yes() {
-    local answer
-    answer=$(ask "$1 (y/n)" "$2")
-    [[ $answer =~ ^[Yy] ]]
+    ask "$1 (y/n)" "$2"
+    [[ $ANSWER =~ ^[Yy] ]]
 }
 
 valid_mode() {
@@ -621,6 +624,14 @@ valid_tls_names() {
     done
 }
 
+valid_domain() {
+    [[ $1 =~ ^([a-z0-9-]+\.)+[a-z]{2,}$ ]]
+}
+
+valid_email() {
+    [[ $1 =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]
+}
+
 valid_https_url() {
     [[ $1 =~ ^https://[^[:space:]]+$ ]]
 }
@@ -633,18 +644,20 @@ valid_interval() {
     [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -ge 60 ]
 }
 
-node_count_for_mode() {
-    [ "$1" = single ] && { printf '1'; return; }
+ask_node_count() {
+    [ "$1" = single ] && { ANSWER=1; return; }
     ask_valid "How many servers (3 or more, odd numbers survive more failures)" 3 valid_group_size "enter $FAILOVER_MINIMUM_NODES or more"
 }
 
 ask_node() {
-    local index=$1 name public private
-    printf '\nServer %s\n' "$index" >&2
-    name=$(ask_valid "  name" "$(printf 'valkey-%02d' "$index")" valid_node_name "lowercase letters, digits and -")
-    public=$(ask_valid "  public IP (for SSH)" "" valid_ipv4 "enter an IPv4 address")
-    private=$(ask_valid "  private VPC IP" "" valid_ipv4 "enter an IPv4 address")
-    printf '%s=%s/%s' "$name" "$public" "$private"
+    local name public
+    printf '\nServer %s\n' "$1" >&2
+    ask_valid "  name" "$(printf 'valkey-%02d' "$1")" valid_node_name "lowercase letters, digits and -"
+    name=$ANSWER
+    ask_valid "  public IP (for SSH)" "" valid_ipv4 "enter an IPv4 address"
+    public=$ANSWER
+    ask_valid "  private VPC IP" "" valid_ipv4 "enter an IPv4 address"
+    ANSWER="$name=$public/$ANSWER"
 }
 
 public_ips_in() {
@@ -656,55 +669,93 @@ public_ips_in() {
 }
 
 inventory_line() {
-    [[ $2 =~ [\"\$\`\\] ]] && { printf '%s=%q\n' "$1" "$2"; return; }
-    printf '%s="%s"\n' "$1" "$2"
+    local line
+    if [[ $2 =~ [\"\$\`\\] ]]; then
+        printf -v line '%s=%q' "$1" "$2"
+    else
+        printf -v line '%s="%s"' "$1" "$2"
+    fi
+    INVENTORY_TEXT+="$line"$'\n'
 }
 
-backup_lines() {
+ask_backups() {
     if ! ask_yes "Back up to S3-compatible storage" n; then
         inventory_line BACKUP_ENABLED false
         return 0
     fi
     inventory_line BACKUP_ENABLED true
-    inventory_line S3_ENDPOINT "$(ask_valid "  S3 endpoint" "https://sg-s3.storage.bunnycdn.com" valid_https_url "must start with https://")"
-    inventory_line S3_REGION "$(ask_valid "  S3 region" "sg" valid_word "letters, digits and -")"
-    inventory_line S3_BUCKET "$(ask_valid "  bucket (Bunny: storage zone name)" "" valid_word "letters, digits, . and -")"
-    inventory_line S3_ACCESS_KEY_ID "$(ask_valid "  access key (Bunny: storage zone name)" "" valid_word "letters, digits and ./+=-")"
-    inventory_line S3_SECRET_ACCESS_KEY "$(ask_secret "  secret key (hidden)")"
-    inventory_line BACKUP_INTERVAL_SECONDS "$(ask_valid "  seconds between backups" 3600 valid_interval "60 or more")"
+    ask_valid "  S3 endpoint" "https://sg-s3.storage.bunnycdn.com" valid_https_url "must start with https://"
+    inventory_line S3_ENDPOINT "$ANSWER"
+    ask_valid "  S3 region" "sg" valid_word "letters, digits and -"
+    inventory_line S3_REGION "$ANSWER"
+    ask_valid "  bucket (Bunny: storage zone name)" "" valid_word "letters, digits, . and -"
+    inventory_line S3_BUCKET "$ANSWER"
+    ask_valid "  access key (Bunny: storage zone name)" "" valid_word "letters, digits and ./+=-"
+    inventory_line S3_ACCESS_KEY_ID "$ANSWER"
+    ask_secret "  secret key (hidden)"
+    inventory_line S3_SECRET_ACCESS_KEY "$ANSWER"
+    ask_valid "  seconds between backups" 3600 valid_interval "60 or more"
+    inventory_line BACKUP_INTERVAL_SECONDS "$ANSWER"
 }
 
-inventory_answers() {
-    local mode count index nodes='' entry
+ask_domain() {
+    ask_yes "Use your own domain with a free Let's Encrypt certificate (DNS on Cloudflare)" n || { ANSWER=''; return 0; }
+    ask_valid "  domain, e.g. valkey.example.com" "" valid_domain "a lowercase domain name like valkey.example.com"
+}
+
+ask_cloudflare_token() {
+    ask_secret "  Cloudflare API token with Zone > DNS > Edit for this domain (hidden)"
+    valid_word "$ANSWER" || die "that does not look like a Cloudflare API token"
+}
+
+ask_acme_settings() {
+    inventory_line ACME_DOMAIN "$1"
+    ask_valid "  email for Let's Encrypt notices" "" valid_email "an email address"
+    inventory_line ACME_EMAIL "$ANSWER"
+    ask_cloudflare_token
+    inventory_line CF_DNS_API_TOKEN "$ANSWER"
+}
+
+ask_inventory() {
+    local mode count index nodes='' domain
+    INVENTORY_TEXT=''
     printf 'No inventory for cluster %s yet, answer a few questions (Enter keeps the [default]).\n\n' "$CLUSTER" >&2
-    mode=$(ask_valid "Mode: single (1 server, no failover) or ha (3+ servers, automatic failover)" ha valid_mode "type single or ha")
-    count=$(node_count_for_mode "$mode")
+    ask_valid "Mode: single (1 server, no failover) or ha (3+ servers, automatic failover)" ha valid_mode "type single or ha"
+    mode=$ANSWER
+    ask_node_count "$mode"
+    count=$ANSWER
     for index in $(seq 1 "$count"); do
-        entry=$(ask_node "$index")
-        nodes="${nodes:+$nodes }$entry"
+        ask_node "$index"
+        nodes="${nodes:+$nodes }$ANSWER"
     done
     printf '\n' >&2
     inventory_line NODES "$nodes"
-    inventory_line SSH_USER "$(ask "SSH user" root)"
-    inventory_line IMAGE "$(ask "Image" "$DEFAULT_IMAGE")"
-    inventory_line TLS_NAMES "$(ask_valid "Names clients use for TLS port 6380: load balancer IP/hostname, space separated" "$(public_ips_in "$nodes")" valid_tls_names "IPs or hostnames separated by spaces")"
+    ask "SSH user" root
+    inventory_line SSH_USER "$ANSWER"
+    ask "Image" "$DEFAULT_IMAGE"
+    inventory_line IMAGE "$ANSWER"
+    ask_domain
+    domain=$ANSWER
+    ask_valid "Names clients use for TLS port 6380: load balancer IP/hostname, space separated" "${domain:+$domain }$(public_ips_in "$nodes")" valid_tls_names "IPs or hostnames separated by spaces"
+    inventory_line TLS_NAMES "$ANSWER"
+    [ -z "$domain" ] || ask_acme_settings "$domain"
     if ask_yes "Require client certificates (mutual TLS)" y; then
         inventory_line TLS_CLIENT_VERIFY required
     else
         inventory_line TLS_CLIENT_VERIFY none
     fi
-    backup_lines
+    ask_backups
 }
 
 create_inventory() {
-    local answers tmp
-    answers=$(inventory_answers)
-    printf '\n%s\n\n' "$(printf '%s\n' "$answers" | grep -v '^S3_SECRET_ACCESS_KEY=')" >&2
+    local tmp
+    ask_inventory
+    printf '\n%s\n\n' "$(printf '%s' "$INVENTORY_TEXT" | grep -vE '^(S3_SECRET_ACCESS_KEY|CF_DNS_API_TOKEN)=')" >&2
     ask_yes "Write this to $INVENTORY" y || die "aborted, nothing written"
     mkdir -p "$CLUSTERS_DIR"
     chmod 700 "$CLUSTERS_DIR"
     tmp=$(mktemp "$INVENTORY.XXXXXX")
-    printf '%s\n' "$answers" > "$tmp"
+    printf '%s' "$INVENTORY_TEXT" > "$tmp"
     chmod 600 "$tmp"
     mv "$tmp" "$INVENTORY"
     log "wrote $INVENTORY"
@@ -1315,6 +1366,7 @@ cmd_list() {
 }
 
 connection_host() {
+    [ -n "${ACME_DOMAIN:-}" ] && { printf '%s' "$ACME_DOMAIN"; return; }
     local names
     read -r -a names <<<"$TLS_NAMES"
     [ "${#names[@]}" -gt 0 ] && { printf '%s' "${names[0]}"; return; }
@@ -1332,9 +1384,11 @@ require_local_file() {
 cmd_env() {
     load_inventory "${1:-}"
     [ -n "$VALKEY_PASSWORD" ] || die "no password yet, run: valkeyctl init $CLUSTER"
-    require_local_file ca.crt
     printf 'REDIS_CLIENT=phpredis\nREDIS_SCHEME=tls\nREDIS_HOST=%s\nREDIS_PORT=6380\nREDIS_PASSWORD=%s\n' "$(connection_host)" "$VALKEY_PASSWORD"
-    printf 'REDIS_TLS_CA_B64=%s\n' "$(base64_of "$TLS_LOCAL_DIR/ca.crt")"
+    if [ -z "${ACME_DOMAIN:-}" ]; then
+        require_local_file ca.crt
+        printf 'REDIS_TLS_CA_B64=%s\n' "$(base64_of "$TLS_LOCAL_DIR/ca.crt")"
+    fi
     [ "${TLS_CLIENT_VERIFY:-required}" = required ] || return 0
     require_local_file client.crt
     require_local_file client.key
@@ -1408,6 +1462,63 @@ cmd_uninstall() {
     log "deleted $STATE_DIR"
 }
 
+certificate_issued_on() {
+    run_on "$1" 'docker exec valkey-proxy-1 sh -c "ls /acme/lego/certificates/*.crt" >/dev/null 2>&1'
+}
+
+lego_log_on() {
+    run_on "$1" 'docker exec valkey-proxy-1 tail -n 3 /acme/lego.log 2>/dev/null' | tr '\n' ' '
+}
+
+wait_for_certificate_on() {
+    local deadline=$((SECONDS + ACME_WAIT_SECONDS))
+    log "$1: waiting for Let's Encrypt to issue the certificate"
+    until certificate_issued_on "$1"; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            log "$1: $(lego_log_on "$1")"
+            die "no certificate on $1 after ${ACME_WAIT_SECONDS}s; check the token and that $ACME_DOMAIN exists in Cloudflare. The proxy keeps serving the old certificate and retries every 5 minutes"
+        fi
+        sleep 5
+    done
+    log "$1: certificate issued"
+}
+
+enable_domain_on() {
+    log "$1: switching the proxy to the Let's Encrypt certificate for $ACME_DOMAIN"
+    on "$1" DOMAIN="$ACME_DOMAIN" EMAIL="$ACME_EMAIL" TOKEN="$CF_DNS_API_TOKEN" COMPOSE="$2" IMAGE="$IMAGE" <<'EOS'
+docker pull -q "$IMAGE" </dev/null >/dev/null
+write_file "$VALKEY_DIR/compose.yaml" 644 "$COMPOSE"
+set_env_key ACME_DOMAIN "$DOMAIN"
+set_env_key ACME_EMAIL "$EMAIL"
+set_env_key CF_DNS_API_TOKEN "$TOKEN"
+compose up -d --no-deps --force-recreate proxy >/dev/null 2>&1
+EOS
+}
+
+cmd_domain() {
+    preflight "${1:-}"
+    local domain email token compose node
+    ask_valid "Domain, e.g. valkey.example.com" "${ACME_DOMAIN:-}" valid_domain "a lowercase domain name like valkey.example.com"
+    domain=$ANSWER
+    ask_valid "Email for Let's Encrypt notices" "${ACME_EMAIL:-}" valid_email "an email address"
+    email=$ANSWER
+    ask_cloudflare_token
+    token=$ANSWER
+    confirm "save ACME_DOMAIN=$domain, ACME_EMAIL and CF_DNS_API_TOKEN in $INVENTORY" \
+        "on each node, one at a time: pull $IMAGE, write compose.yaml, recreate the proxy and wait for the certificate" \
+        "connections through a node's proxy drop once while it restarts; clients reconnect"
+    lock_cluster
+    set_inventory_var ACME_DOMAIN "$domain"
+    set_inventory_var ACME_EMAIL "$email"
+    set_inventory_var CF_DNS_API_TOKEN "$token"
+    compose=$(compose_for "$IMAGE")
+    for node in $(node_names); do
+        enable_domain_on "$node" "$compose"
+        wait_for_certificate_on "$node"
+    done
+    log "done: point $domain (DNS only, grey cloud) at your load balancer or the servers' public IPs, then run: valkeyctl env $CLUSTER"
+}
+
 main() {
     local arguments=() argument
     for argument in "$@"; do
@@ -1422,7 +1533,7 @@ main() {
     local command=${1:-help}
     shift || true
     case "$command" in
-        init | status | add-node | remove-node | replace-node | failover | upgrade | rotate-certs | test-failover | backup-now | list | env | certs | cli | ssh | version | self-update | uninstall)
+        init | status | add-node | remove-node | replace-node | failover | upgrade | rotate-certs | test-failover | backup-now | domain | list | env | certs | cli | ssh | version | self-update | uninstall)
             "cmd_${command//-/_}" "$@"
             ;;
         help | -h | --help) usage ;;

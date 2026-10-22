@@ -3,18 +3,23 @@ set -eu
 
 . /usr/local/lib/valkey-backup/common.sh
 . /usr/local/lib/valkey-backup/topology.sh
+. /usr/local/lib/valkey-backup/acme.sh
 
 TLS_DIR=/tls
 PROXY_CONF=/tmp/haproxy.cfg
+RENEW_CHECK_SECONDS=43200
+RENEW_RETRY_SECONDS=300
 
 : "${TLS_PROXY_PORT:=6380}"
 : "${TLS_CLIENT_VERIFY:=required}"
 : "${PRIMARY_PROBE_PORT:=8080}"
 
+[ "$(id -u)" = "0" ] && acme_enabled && prepare_acme_dir
 drop_privileges "$0" "$@"
 
 validate_env() {
     validate_topology_env
+    validate_acme_env
     require_integer_at_least TLS_PROXY_PORT 1
     require_integer_at_least PRIMARY_PROBE_PORT 1
     case "$TLS_CLIENT_VERIFY" in
@@ -42,6 +47,11 @@ backend_servers() {
     done
 }
 
+served_certificate() {
+    acme_enabled && { printf '%s/serving.pem' "$ACME_DIR"; return; }
+    printf '%s/server.pem' "$TLS_DIR"
+}
+
 write_config() {
     cat > "$PROXY_CONF" <<EOF
 global
@@ -61,7 +71,7 @@ defaults
     timeout server 1h
 
 frontend valkey_tls
-    bind :$TLS_PROXY_PORT ssl crt $TLS_DIR/server.pem ca-file $TLS_DIR/ca.crt verify $TLS_CLIENT_VERIFY
+    bind :$TLS_PROXY_PORT ssl crt $(served_certificate) ca-file $TLS_DIR/ca.crt verify $TLS_CLIENT_VERIFY
     default_backend valkey_primary
 
 backend valkey_primary
@@ -73,11 +83,43 @@ $(backend_servers)
 EOF
 }
 
+refresh_certificate() {
+    renew_acme_certificate || true
+    write_serving_certificate "$TLS_DIR/server.pem"
+}
+
+seconds_until_next_renewal() {
+    acme_certificate_ready && { printf '%s' "$RENEW_CHECK_SECONDS"; return; }
+    printf '%s' "$RENEW_RETRY_SECONDS"
+}
+
+stop_proxy() {
+    kill -TERM "$haproxy_pid" 2>/dev/null
+    wait "$haproxy_pid"
+    exit 0
+}
+
+keep_certificate_fresh() {
+    trap stop_proxy TERM INT
+    while kill -0 "$haproxy_pid" 2>/dev/null; do
+        sleep "$(seconds_until_next_renewal)" &
+        wait $! || true
+        refresh_certificate || continue
+        log "certificate for $ACME_DOMAIN updated, reloading the proxy"
+        kill -USR2 "$haproxy_pid"
+    done
+}
+
 main() {
     validate_env
     write_config
     log "TLS on :$TLS_PROXY_PORT (client certificates $TLS_CLIENT_VERIFY), routing to the primary among: $(proxy_targets | tr '\n' ' ')"
-    exec haproxy -db -f "$PROXY_CONF"
+    acme_enabled || exec haproxy -db -f "$PROXY_CONF"
+    refresh_certificate || true
+    acme_certificate_ready || log "WARNING: serving the private certificate until Let's Encrypt succeeds for $ACME_DOMAIN"
+    haproxy -W -db -f "$PROXY_CONF" &
+    haproxy_pid=$!
+    keep_certificate_fresh
 }
 
 main

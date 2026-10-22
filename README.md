@@ -9,6 +9,7 @@
 - [Creating a Cluster](#creating-a-cluster)
     - [Single Server or High Availability](#single-server-or-high-availability)
 - [Connecting Laravel](#connecting-laravel)
+    - [Using Your Own Domain](#using-your-own-domain)
     - [Without Client Certificates](#without-client-certificates)
     - [With Client Certificates](#with-client-certificates)
 - [Managing Servers](#managing-servers)
@@ -120,12 +121,38 @@ The `env` command prints the settings for your application's `.env`:
 valkeyctl env main
 ```
 
-The connection is always encrypted. Your application needs one file, `ca.crt`, to confirm it is talking to your servers. What else it needs depends on how you answered **Require client certificates** during `init`.
+The connection is always encrypted. With your own domain, these settings are all your application needs. Without one, the servers use a private certificate and your application also needs its `ca.crt` file.
+
+<a name="using-your-own-domain"></a>
+### Using Your Own Domain
+
+The simplest setup gives your servers a free, publicly trusted certificate from Let's Encrypt, so Laravel connects with plain `.env` settings and no certificate files.
+
+You need a domain whose DNS is on Cloudflare and a Cloudflare API token with **Zone → DNS → Edit** for that zone only. Answer **y** to the domain question during `init`, or switch an existing cluster at any time:
+
+```bash
+valkeyctl domain main
+```
+
+Then point the domain at your load balancer, or at your servers' public IPs, with a DNS-only (grey cloud) record. `env` now prints:
+
+```env
+REDIS_CLIENT=phpredis
+REDIS_SCHEME=tls
+REDIS_HOST=valkey.example.com
+REDIS_PORT=6380
+REDIS_PASSWORD=...
+```
+
+Certificates renew automatically. Until the first one is issued, the servers keep using their private certificate.
+
+> [!NOTE]
+> Let's Encrypt proves you own the domain by creating a temporary DNS record, which is why the token is needed. No ports have to be opened for it.
 
 <a name="without-client-certificates"></a>
 ### Without Client Certificates
 
-If you answered **No**, `env` prints:
+Without a domain, and if you answered **No** to **Require client certificates**, `env` prints:
 
 ```env
 REDIS_CLIENT=phpredis
@@ -313,6 +340,7 @@ valkeyctl ssh main valkey-01
 | `test-failover <cluster>` | Measure a failover under write load |
 | `upgrade <cluster> [tag]` | Rolling upgrade to a new image |
 | `rotate-certs <cluster> [--client]` | Issue new certificates |
+| `domain <cluster>` | Use a Let's Encrypt certificate for your domain |
 | `backup-now <cluster>` | Upload a backup now |
 | `env <cluster>` | Print Laravel environment variables |
 | `certs <cluster> [dir]` | Copy the client certificates |

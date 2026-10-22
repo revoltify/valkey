@@ -29,6 +29,7 @@ services:
     entrypoint: [/sbin/tini, --, tls-proxy]
     volumes:
       - ./tls:/tls:ro
+      - ./acme:/acme
     ulimits:
       nofile: 65535
     healthcheck:
