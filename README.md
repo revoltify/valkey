@@ -9,7 +9,6 @@ Production Valkey 9 image for plain VPS (DigitalOcean, OVH, Hetzner…). Runs as
 - Optional Sentinel mode: automatic failover in about 10 seconds, nodes can be added or removed.
 - A TLS proxy (HAProxy) on every node accepts clients on port 6380 with mutual TLS and forwards them to whichever node is primary. The app sees one host and one password, on any node.
 - A primary probe on port 8080 answers `200` only on the current primary; the proxies (or a load balancer) use it to find the primary.
-- A watchdog on every node sends alerts (webhook or Telegram) when Valkey, replication, Sentinel, memory, disk, backups or certificates go wrong, pings a heartbeat URL while healthy, and proves the newest backup restores once a week.
 - Auto-tuned from the container's cgroup CPU and memory limits, or the server's memory.
 - Every Valkey directive can be set through env vars.
 
@@ -21,7 +20,7 @@ App (e.g. Bunny Magic Containers) → valkey.example.com:6380  (DNS: every node'
    ┌────────── any node ──────────┐
    │ proxy :6380 (HAProxy, mTLS)  │──→ current primary, found through probe :8080
    │ valkey :6379                 │
-   │ sentinel :26379              │   private network: WireGuard wg0 (10.10.0.x) or a provider VPC
+   │ sentinel :26379              │   private network: the provider's VPC
    │ probe :8080                  │
    └──────────────────────────────┘
 ```
@@ -43,7 +42,7 @@ docker build -t valkey-s3 .
 | Variable | Description |
 |---|---|
 | `VALKEY_PASSWORD` | 32+ chars, `A-Z a-z 0-9 _ -` only. Generate with `openssl rand -hex 32`. Same value on every node. |
-| `VALKEY_PRIVATE_IP` | The server's private IP (WireGuard `10.10.0.x` or the provider VPC). Valkey, Sentinel and the probe bind only to it and `127.0.0.1`. `0.0.0.0` binds everything, only for local testing behind Docker's port mapping. |
+| `VALKEY_PRIVATE_IP` | The server's private VPC IP. Valkey, Sentinel and the probe bind only to it and `127.0.0.1`. `0.0.0.0` binds everything, only for local testing behind Docker's port mapping. |
 | `S3_ENDPOINT` | `https://` only, e.g. `https://sg-s3.storage.bunnycdn.com`. |
 | `S3_REGION` | e.g. `sg` for Bunny, `auto` for R2, `eu-central-1` for AWS. Defaults to `us-east-1`. |
 | `S3_BUCKET` | Bucket name. On Bunny this is the storage zone name. |
@@ -134,38 +133,6 @@ Every node runs the backup loop, but only the current primary uploads, so backup
 
 Replicas protect against a dead server, not against bad writes. A `FLUSHALL` or a buggy deploy reaches every replica within milliseconds. The S3 backups are the way back from those.
 
-**Restore check.** `restore-check` downloads the newest backup, verifies it like a real restore, loads it into a throwaway `valkey-server` on a local socket, and compares the loaded key count with the count recorded at upload (at least 90% must load, allowing for keys that expired since). It refuses to run when free memory is below ~1.2× the live dataset, so it can't starve the node. The watchdog runs it on the primary every `RESTORE_CHECK_INTERVAL_DAYS`; run it by hand with `docker exec valkey-watchdog-1 restore-check`.
-
-### Alerts
-
-The `watchdog` service checks its own node every `WATCHDOG_INTERVAL_SECONDS` and alerts only when a check changes state (`FAIL` / `RESOLVED`), repeating every `ALERT_REPEAT_HOURS` while it stays failing. Nothing is sent during the first 2 minutes after it starts, so deploys and restarts stay quiet. If an alert can't be delivered it is retried on the next check.
-
-| Variable | Default | Description |
-|---|---|---|
-| `ALERT_WEBHOOK_URL` | unset | POSTs `{"text": …, "content": …}`: works with Slack, Mattermost and Discord webhooks. |
-| `ALERT_TELEGRAM_BOT_TOKEN` / `ALERT_TELEGRAM_CHAT_ID` | unset | Telegram bot delivery. |
-| `ALERT_NODE_NAME` | hostname | Name shown in messages, e.g. `valkey-01`. |
-| `HEARTBEAT_URL` | unset | Pinged (GET) after every healthy check. Use a heartbeat monitor (healthchecks.io, Better Stack) per node: when pings stop, the node is down or cut off, which it can't report itself. |
-| `WATCHDOG_INTERVAL_SECONDS` | `30` | Time between checks. |
-| `ALERT_REPEAT_HOURS` | `6` | Reminder interval for a check that stays failing. |
-| `ALERT_MEMORY_PERCENT` | `80` | `memory_high` threshold, as a share of `maxmemory`. |
-| `ALERT_DISK_PERCENT` | `80` | `disk_high` threshold for `/data`. |
-| `RESTORE_CHECK_INTERVAL_DAYS` | `7` | How often the primary proves the newest backup restores. |
-
-| Check | Fails when | Reported by |
-|---|---|---|
-| `valkey_down` | Valkey doesn't answer `PING` within 3 s | every node |
-| `role_changed` | The node switched between primary and replica (info, sent once) | every node |
-| `replicas_missing` | Fewer replicas online than `SENTINEL_HOSTS` minus one, for 30 s or more | primary |
-| `replication_broken` | Link to the primary down for 30 s or more | replica |
-| `sentinel_unhealthy` | `SENTINEL CKQUORUM` fails | every node in a group |
-| `memory_high` | Used memory above `ALERT_MEMORY_PERCENT` of `maxmemory` | primary |
-| `writes_rejected` | New `OOM` errors since the last check: jobs are being refused | primary |
-| `disk_high` | `/data` above `ALERT_DISK_PERCENT` (checked every 10 min) | every node |
-| `cert_expiring` | `server.pem` expires within 21 days (every 10 min) | every node |
-| `backup_stale` | Newest backup older than twice `BACKUP_INTERVAL_SECONDS`, or S3 can't be listed (every 10 min) | primary |
-| `restore_check_failed` | The last restore check failed | primary |
-
 ## Deploy
 
 Step-by-step for DigitalOcean droplets behind a load balancer: [DEPLOY.md](DEPLOY.md). The steps below are the provider-neutral version.
@@ -180,39 +147,21 @@ sh host/setup
 
 It sets `vm.overcommit_memory=1` (BGSAVE and AOF rewrite can fork safely) and `net.core.somaxconn=1024`, and disables transparent huge pages.
 
-### 2. Private network (groups only)
+### 2. Private network and firewall
 
-Skip this on a single node, or when the provider gives you a private VPC. Otherwise build a WireGuard mesh. On every server:
+All nodes of a group must share a private network (the provider's VPC, e.g. DigitalOcean VPC, Hetzner Cloud Network, OVH vRack). Use each node's private IP as `VALKEY_PRIVATE_IP` and in `SENTINEL_HOSTS`; replication and Sentinel traffic stays on it.
 
-```bash
-sh host/wireguard key
-```
+Restrict access in the provider's firewall: SSH from your IP, everything from the private network, and the TLS port `6380` from your load balancer or app. Containers use host networking, so nothing else is published.
 
-It prints that server's public key. Then on each server, pass its own WireGuard IP and one `<public-key>@<public-ip>@<wireguard-ip>` entry per other server:
-
-```bash
-sh host/wireguard up 10.10.0.1 KEY2@203.0.113.11@10.10.0.2 KEY3@203.0.113.12@10.10.0.3
-```
-
-Use the WireGuard IPs (`10.10.0.x`) as `VALKEY_PRIVATE_IP` and in `SENTINEL_HOSTS`. Replication and Sentinel traffic then runs encrypted over `wg0`.
-
-### 3. Firewall (each server, as root)
-
-```bash
-sh host/firewall 203.0.113.11 203.0.113.12
-```
-
-Pass the other servers' public IPs. It allows SSH, the TLS port and WireGuard from those peers, and everything on `wg0`; everything else is dropped. Containers use host networking, so these ufw rules apply to them; Docker's port publishing is not used and can't bypass the firewall.
-
-### 4. Certificates
+### 3. Certificates
 
 Run `generate-certs` once (see TLS proxy above) and copy the same `tls` folder next to `compose.yaml` on every server.
 
-### 5. DNS
+### 4. DNS
 
 Create one hostname, e.g. `valkey.example.com`, with an A record per server. With Bunny DNS, put them in one record set and turn on health monitoring, so an offline server is dropped from answers. Any live server's proxy reaches the primary, so DNS only needs to know which servers are up.
 
-### 6. Start the nodes
+### 5. Start the nodes
 On each server, rename `.env.example` to `.env` and fill it in.
 
 Single node (no `SENTINEL_HOSTS`):
@@ -238,14 +187,14 @@ docker exec valkey-sentinel-1 sh -c 'VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli 
 ```
 
 ### Adding a node
-Create a server, run `host/setup`, add it to the WireGuard mesh on every server, copy the `tls` folder, add it to DNS, set `.env` with `SENTINEL_HOSTS` (any existing node is enough) and `VALKEY_INITIAL_PRIMARY=false`, then `docker compose --profile ha up -d`. It joins as a replica and its Sentinel is discovered by the others. Raise the quorum to the new majority on every Sentinel:
+Create a server in the same VPC, run `host/setup`, copy the `tls` folder, add it to DNS, set `.env` with `SENTINEL_HOSTS` (any existing node is enough) and `VALKEY_INITIAL_PRIMARY=false`, then `docker compose --profile ha up -d`. It joins as a replica and its Sentinel is discovered by the others. Raise the quorum to the new majority on every Sentinel:
 
 ```bash
 docker exec valkey-sentinel-1 sh -c 'VALKEYCLI_AUTH=$VALKEY_PASSWORD valkey-cli -p 26379 SENTINEL SET main quorum 3'
 ```
 
 ### Removing a node
-Stop it with `docker compose --profile ha down`, remove it from DNS and the WireGuard mesh, then on every remaining Sentinel run `SENTINEL RESET main` so it forgets the node.
+Stop it with `docker compose --profile ha down`, remove it from DNS, then on every remaining Sentinel run `SENTINEL RESET main` so it forgets the node.
 
 ### Going from a group to one node
 Stop `sentinel` and `valkey` on the replicas. On the primary, remove `SENTINEL_HOSTS` from `.env` and run `docker compose --profile ha down && docker compose up -d`. Laravel keeps using the same hostname.

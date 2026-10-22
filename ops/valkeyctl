@@ -6,7 +6,7 @@ REPO_DIR=$(dirname "$OPS_DIR")
 CLUSTERS_DIR=${VALKEYCTL_CLUSTERS_DIR:-$OPS_DIR/clusters}
 DEFAULT_IMAGE=ghcr.io/revoltify/valkey:latest
 REMOTE_DIR=/srv/valkey
-NODE_ENV_PASSTHROUGH='^(S3_[A-Z_]+|BACKUP_[A-Z_]+|RESTORE_[A-Z_]+|ALERT_[A-Z_]+|WATCHDOG_[A-Z_]+|HEARTBEAT_URL|TLS_CLIENT_VERIFY|VALKEY_MAXMEMORY_PERCENT)$'
+NODE_ENV_PASSTHROUGH='^(S3_[A-Z_]+|BACKUP_[A-Z_]+|RESTORE_[A-Z_]+|TLS_CLIENT_VERIFY|VALKEY_MAXMEMORY_PERCENT)$'
 IPV4='([0-9]{1,3}\.){3}[0-9]{1,3}'
 FAILOVER_TEST_SETTLE_SECONDS=10
 
@@ -32,7 +32,6 @@ usage: valkeyctl [--yes] <command> <cluster> [arguments]
   rotate-certs <cluster> [--client]                reissue the server (and client) certificate from the local CA
   test-failover <cluster>                          stop the primary under write load and measure the impact
   backup-now <cluster>                             run the image's backup on the current primary
-  restore-check <cluster>                          verify the latest backup restores, on the current primary
 
 Inventory: ops/clusters/<cluster>.env (NODES, SSH_USER, IMAGE, TLS_NAMES, VALKEY_PASSWORD).
 EOF
@@ -292,7 +291,7 @@ tls_cli() {
 }
 recreate_endpoints() {
     local services
-    services=$(compose config --services | grep -x -e proxy -e watchdog | paste -sd ' ' -)
+    services=$(compose config --services | grep -x proxy)
     [ -n "$services" ] || return 0
     compose up -d --no-deps --force-recreate $services
 }
@@ -416,7 +415,7 @@ inventory_variable_names() {
 
 passthrough_settings() {
     local name
-    for name in $(inventory_variable_names | grep -E "$NODE_ENV_PASSTHROUGH" | grep -vx -e ALERT_NODE_NAME -e BACKUP_ENABLED -e TLS_CLIENT_VERIFY); do
+    for name in $(inventory_variable_names | grep -E "$NODE_ENV_PASSTHROUGH" | grep -vx -e BACKUP_ENABLED -e TLS_CLIENT_VERIFY); do
         printf '%s=%s\n' "$name" "${!name}"
     done
 }
@@ -432,7 +431,6 @@ VALKEY_INITIAL_PRIMARY=$initial_primary
 SENTINEL_QUORUM=$(majority_of "$(node_count)")
 TLS_CLIENT_VERIFY=${TLS_CLIENT_VERIFY:-required}
 BACKUP_ENABLED=${BACKUP_ENABLED:-false}
-ALERT_NODE_NAME=$1
 EOF
     passthrough_settings
 }
@@ -766,7 +764,7 @@ cmd_upgrade() {
 }
 
 update_membership_on() {
-    log "$1: SENTINEL_HOSTS=$2 SENTINEL_QUORUM=$3, recreating proxy and watchdog"
+    log "$1: SENTINEL_HOSTS=$2 SENTINEL_QUORUM=$3, recreating the proxy"
     on "$1" HOSTS="$2" QUORUM="$3" <<'EOS'
 set_env_key SENTINEL_HOSTS "$HOSTS"
 set_env_key SENTINEL_QUORUM "$QUORUM"
@@ -786,10 +784,10 @@ update_membership() {
 }
 
 template_env_for() {
-    local name=$1 private=$2 template
+    local private=$2 template
     template=$(fetch_remote_file "$3" "$REMOTE_DIR/.env")
     [ -n "$template" ] || die "could not read $REMOTE_DIR/.env on $3"
-    env_with "$template" "VALKEY_PRIVATE_IP=$private" "VALKEY_INITIAL_PRIMARY=false" "ALERT_NODE_NAME=$name" \
+    env_with "$template" "VALKEY_PRIVATE_IP=$private" "VALKEY_INITIAL_PRIMARY=false" \
         "SENTINEL_HOSTS=$(sentinel_hosts_csv)" "SENTINEL_QUORUM=$(majority_of "$(node_count)")"
 }
 
@@ -1114,10 +1112,6 @@ cmd_backup_now() {
     run_on_primary "${1:-}" backup
 }
 
-cmd_restore_check() {
-    run_on_primary "${1:-}" restore-check
-}
-
 main() {
     local arguments=() argument
     for argument in "$@"; do
@@ -1132,7 +1126,7 @@ main() {
     local command=${1:-help}
     shift || true
     case "$command" in
-        init | status | add-node | remove-node | replace-node | failover | upgrade | rotate-certs | test-failover | backup-now | restore-check)
+        init | status | add-node | remove-node | replace-node | failover | upgrade | rotate-certs | test-failover | backup-now)
             "cmd_${command//-/_}" "$@"
             ;;
         help | -h | --help) usage ;;
