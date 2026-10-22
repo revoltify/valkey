@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/valkey-backup/common.sh
+
+export BACKUP_PATH="${1:-$BACKUP_PATH}"
+require_matching BACKUP_PATH "$BACKUP_PATH_PATTERN"
+s3_require_env
+backup_names

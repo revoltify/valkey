@@ -324,6 +324,22 @@ valkeyctl backup-now main
 
 If a server starts with no data, it restores the newest valid backup automatically.
 
+To see which backups exist, run `list-backups` on any server. It reads `BACKUP_PATH` by default, or the path you give it:
+
+```bash
+docker exec valkey-valkey-1 list-backups
+docker exec valkey-valkey-1 list-backups valkey/old-cluster
+```
+
+To start a new cluster from another cluster's backups, or from an older backup, add these lines to the first server's `.env` before its first start:
+
+```ini
+RESTORE_PATH=valkey/old-cluster
+RESTORE_BACKUP=dump-20260101T030000Z.rdb.gz
+```
+
+`RESTORE_PATH` is only read for the restore. New backups still go to `BACKUP_PATH`, so give the new cluster its own path. `RESTORE_BACKUP` picks one backup by its `list-backups` name instead of the newest. Both apply only on the initial primary (`VALKEY_INITIAL_PRIMARY=true`) when it starts with an empty data directory. If the path has no backups or the named backup cannot be restored, the server refuses to start instead of starting empty.
+
 <a name="running-commands"></a>
 ### Running Commands
 

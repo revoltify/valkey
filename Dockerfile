@@ -5,7 +5,7 @@ RUN apk add --no-cache curl~8.22 haproxy~3.4 jq~1.8 lego~4.35 socat~1.8 su-exec~
 
 COPY valkey.conf /usr/local/etc/valkey/valkey.conf
 COPY lib/ /usr/local/lib/valkey-backup/
-COPY --chmod=755 bin/entrypoint bin/sentinel-entrypoint bin/primary-probe bin/primary-status bin/tls-proxy bin/generate-certs bin/backup bin/restore-latest bin/healthcheck /usr/local/bin/
+COPY --chmod=755 bin/entrypoint bin/sentinel-entrypoint bin/primary-probe bin/primary-status bin/tls-proxy bin/generate-certs bin/backup bin/list-backups bin/restore-latest bin/healthcheck /usr/local/bin/
 
 ENV VALKEY_CONFIG_SAVE="3600 1" \
     VALKEY_MAXMEMORY_PERCENT=70 \
