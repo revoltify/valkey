@@ -135,6 +135,8 @@ Replicas protect against a dead server, not against bad writes. A `FLUSHALL` or 
 
 ## Deploy
 
+Step-by-step for DigitalOcean droplets behind a load balancer: [DEPLOY.md](DEPLOY.md). The steps below are the provider-neutral version.
+
 Works on any VPS with Docker (DigitalOcean, OVH, Hetzner…). Use Ubuntu 24.04 or Debian 12 with at least 2 GB RAM, ideally in the region closest to your app. Copy this repository's `host/` folder plus `compose.yaml` and `.env.example` to each server, e.g. `/srv/valkey`.
 
 ### 1. Host settings (each server, as root)
