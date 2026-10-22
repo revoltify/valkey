@@ -9,8 +9,8 @@
 - [Creating a Cluster](#creating-a-cluster)
     - [Single Server or High Availability](#single-server-or-high-availability)
 - [Connecting Laravel](#connecting-laravel)
-    - [Environment Variables](#environment-variables)
-    - [Client Certificates](#client-certificates)
+    - [Without Client Certificates](#without-client-certificates)
+    - [With Client Certificates](#with-client-certificates)
 - [Managing Servers](#managing-servers)
     - [Adding Servers](#adding-servers)
     - [Removing Servers](#removing-servers)
@@ -114,14 +114,18 @@ A **single server** is the simplest start, but it has no failover: restarting it
 <a name="connecting-laravel"></a>
 ## Connecting Laravel
 
-<a name="environment-variables"></a>
-### Environment Variables
-
-The `env` command prints everything your application needs:
+The `env` command prints the settings for your application's `.env`:
 
 ```bash
 valkeyctl env main
 ```
+
+The connection is always encrypted. Your application needs one file, `ca.crt`, to confirm it is talking to your servers. What else it needs depends on how you answered **Require client certificates** during `init`.
+
+<a name="without-client-certificates"></a>
+### Without Client Certificates
+
+If you answered **No**, `env` prints:
 
 ```env
 REDIS_CLIENT=phpredis
@@ -130,33 +134,15 @@ REDIS_HOST=valkey.example.com
 REDIS_PORT=6380
 REDIS_PASSWORD=...
 REDIS_TLS_CA_B64=...
-REDIS_TLS_CERT_B64=...
-REDIS_TLS_KEY_B64=...
 ```
 
-Copy these lines into your application's environment.
-
-<a name="client-certificates"></a>
-### Client Certificates
-
-phpredis reads certificates from files. On platforms that only offer environment variables, such as Bunny Magic Containers, write the base64 values to files when the container starts:
+Save the certificate as a file when your application starts. On Bunny Magic Containers, add this to your container's start command:
 
 ```bash
-mkdir -p /tmp/valkey \
-  && echo "$REDIS_TLS_CA_B64" | base64 -d > /tmp/valkey/ca.crt \
-  && echo "$REDIS_TLS_CERT_B64" | base64 -d > /tmp/valkey/client.crt \
-  && echo "$REDIS_TLS_KEY_B64" | base64 -d > /tmp/valkey/client.key
+mkdir -p /tmp/valkey && echo "$REDIS_TLS_CA_B64" | base64 -d > /tmp/valkey/ca.crt
 ```
 
-On a regular server, copy the files directly instead. `certs` writes `ca.crt`, `client.crt` and `client.key` to the current directory, or to the directory you pass:
-
-```bash
-valkeyctl certs main storage/valkey
-```
-
-and set `REDIS_TLS_CA`, `REDIS_TLS_CERT` and `REDIS_TLS_KEY` to those file paths.
-
-Then point your Redis connection at the files in `config/database.php`:
+Then add a `context` to your Redis connection in `config/database.php`:
 
 ```php
 'default' => [
@@ -167,15 +153,45 @@ Then point your Redis connection at the files in `config/database.php`:
     'database' => env('REDIS_DB', '0'),
     'context' => [
         'stream' => [
-            'cafile' => env('REDIS_TLS_CA', '/tmp/valkey/ca.crt'),
-            'local_cert' => env('REDIS_TLS_CERT', '/tmp/valkey/client.crt'),
-            'local_pk' => env('REDIS_TLS_KEY', '/tmp/valkey/client.key'),
-            'verify_peer' => true,
-            'verify_peer_name' => true,
+            'cafile' => '/tmp/valkey/ca.crt',
         ],
     ],
 ],
 ```
+
+<a name="with-client-certificates"></a>
+### With Client Certificates
+
+If you answered **Yes**, your application also proves its identity with a client certificate, so `env` adds two more lines:
+
+```env
+REDIS_TLS_CERT_B64=...
+REDIS_TLS_KEY_B64=...
+```
+
+Write all three files when your application starts:
+
+```bash
+mkdir -p /tmp/valkey \
+  && echo "$REDIS_TLS_CA_B64" | base64 -d > /tmp/valkey/ca.crt \
+  && echo "$REDIS_TLS_CERT_B64" | base64 -d > /tmp/valkey/client.crt \
+  && echo "$REDIS_TLS_KEY_B64" | base64 -d > /tmp/valkey/client.key
+```
+
+And reference them in the `context`:
+
+```php
+'context' => [
+    'stream' => [
+        'cafile' => '/tmp/valkey/ca.crt',
+        'local_cert' => '/tmp/valkey/client.crt',
+        'local_pk' => '/tmp/valkey/client.key',
+    ],
+],
+```
+
+> [!NOTE]
+> On a regular server, skip the decoding: `valkeyctl certs main` copies the files to your current directory. Upload them to your server and use their paths in the `context`.
 
 > [!NOTE]
 > When several applications share one cluster, give each its own `REDIS_DB`, `REDIS_CACHE_DB`, `REDIS_PREFIX` and `HORIZON_PREFIX`. `php artisan cache:clear` empties the whole cache database, so applications should never share a database number.
