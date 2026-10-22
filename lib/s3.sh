@@ -65,6 +65,7 @@ header_value() {
 s3_upload() {
     checksum=$(sha256_of "$1")
     s3_curl --header "x-amz-content-sha256: $checksum" --header "x-amz-meta-sha256: $checksum" \
+        --header "x-amz-meta-keys: $3" \
         --header 'Content-Type: application/octet-stream' \
         --upload-file "$1" "$(object_url "$2")" > /dev/null || return 1
     remote_size=$(s3_head "$2" | header_value content-length)
@@ -73,6 +74,10 @@ s3_upload() {
 
 s3_expected_sha256() {
     s3_head "$1" | header_value x-amz-meta-sha256
+}
+
+s3_recorded_keys() {
+    s3_head "$1" | header_value x-amz-meta-keys
 }
 
 s3_download() {

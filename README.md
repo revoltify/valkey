@@ -9,6 +9,7 @@ Production Valkey 9 image for plain VPS (DigitalOcean, OVH, Hetzner…). Runs as
 - Optional Sentinel mode: automatic failover in about 10 seconds, nodes can be added or removed.
 - A TLS proxy (HAProxy) on every node accepts clients on port 6380 with mutual TLS and forwards them to whichever node is primary. The app sees one host and one password, on any node.
 - A primary probe on port 8080 answers `200` only on the current primary; the proxies (or a load balancer) use it to find the primary.
+- A watchdog on every node sends alerts (webhook or Telegram) when Valkey, replication, Sentinel, memory, disk, backups or certificates go wrong, pings a heartbeat URL while healthy, and proves the newest backup restores once a week.
 - Auto-tuned from the container's cgroup CPU and memory limits, or the server's memory.
 - Every Valkey directive can be set through env vars.
 
@@ -132,6 +133,38 @@ These override `valkey.conf` and the auto-tuned values. `port`, `bind`, `dir`, `
 Every node runs the backup loop, but only the current primary uploads, so backups follow the primary after a failover. Backups are named `dump-<UTC timestamp>.rdb.gz`; anything else in the folder is ignored. Uploads are signed with AWS SigV4 including the payload SHA-256, and the stored size is checked after upload. On restore, every candidate is checked with `gzip -t` and `valkey-check-rdb` (plus the stored SHA-256 where the provider keeps object metadata; Bunny does not) before it replaces anything.
 
 Replicas protect against a dead server, not against bad writes. A `FLUSHALL` or a buggy deploy reaches every replica within milliseconds. The S3 backups are the way back from those.
+
+**Restore check.** `restore-check` downloads the newest backup, verifies it like a real restore, loads it into a throwaway `valkey-server` on a local socket, and compares the loaded key count with the count recorded at upload (at least 90% must load, allowing for keys that expired since). It refuses to run when free memory is below ~1.2× the live dataset, so it can't starve the node. The watchdog runs it on the primary every `RESTORE_CHECK_INTERVAL_DAYS`; run it by hand with `docker exec valkey-watchdog-1 restore-check`.
+
+### Alerts
+
+The `watchdog` service checks its own node every `WATCHDOG_INTERVAL_SECONDS` and alerts only when a check changes state (`FAIL` / `RESOLVED`), repeating every `ALERT_REPEAT_HOURS` while it stays failing. Nothing is sent during the first 2 minutes after it starts, so deploys and restarts stay quiet. If an alert can't be delivered it is retried on the next check.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ALERT_WEBHOOK_URL` | unset | POSTs `{"text": …, "content": …}`: works with Slack, Mattermost and Discord webhooks. |
+| `ALERT_TELEGRAM_BOT_TOKEN` / `ALERT_TELEGRAM_CHAT_ID` | unset | Telegram bot delivery. |
+| `ALERT_NODE_NAME` | hostname | Name shown in messages, e.g. `valkey-01`. |
+| `HEARTBEAT_URL` | unset | Pinged (GET) after every healthy check. Use a heartbeat monitor (healthchecks.io, Better Stack) per node: when pings stop, the node is down or cut off, which it can't report itself. |
+| `WATCHDOG_INTERVAL_SECONDS` | `30` | Time between checks. |
+| `ALERT_REPEAT_HOURS` | `6` | Reminder interval for a check that stays failing. |
+| `ALERT_MEMORY_PERCENT` | `80` | `memory_high` threshold, as a share of `maxmemory`. |
+| `ALERT_DISK_PERCENT` | `80` | `disk_high` threshold for `/data`. |
+| `RESTORE_CHECK_INTERVAL_DAYS` | `7` | How often the primary proves the newest backup restores. |
+
+| Check | Fails when | Reported by |
+|---|---|---|
+| `valkey_down` | Valkey doesn't answer `PING` within 3 s | every node |
+| `role_changed` | The node switched between primary and replica (info, sent once) | every node |
+| `replicas_missing` | Fewer replicas online than `SENTINEL_HOSTS` minus one, for 30 s or more | primary |
+| `replication_broken` | Link to the primary down for 30 s or more | replica |
+| `sentinel_unhealthy` | `SENTINEL CKQUORUM` fails | every node in a group |
+| `memory_high` | Used memory above `ALERT_MEMORY_PERCENT` of `maxmemory` | primary |
+| `writes_rejected` | New `OOM` errors since the last check: jobs are being refused | primary |
+| `disk_high` | `/data` above `ALERT_DISK_PERCENT` (checked every 10 min) | every node |
+| `cert_expiring` | `server.pem` expires within 21 days (every 10 min) | every node |
+| `backup_stale` | Newest backup older than twice `BACKUP_INTERVAL_SECONDS`, or S3 can't be listed (every 10 min) | primary |
+| `restore_check_failed` | The last restore check failed | primary |
 
 ## Deploy
 

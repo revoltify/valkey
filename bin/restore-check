@@ -1,0 +1,81 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/valkey-backup/common.sh
+. /usr/local/lib/valkey-backup/restore.sh
+
+MEMORY_HEADROOM_PERCENT=120
+MINIMUM_KEPT_PERCENT=90
+
+available_memory_bytes() {
+    awk '/^MemAvailable:/ { print $2 * 1024 }' /proc/meminfo
+}
+
+estimated_memory_bytes() {
+    used=$(info_field memory used_memory 2>/dev/null || true)
+    [ -n "$used" ] && { printf '%s' "$used"; return; }
+    printf '%s' "$(($(size_of "$1") * 4))"
+}
+
+require_memory_for() {
+    needed=$(($(estimated_memory_bytes "$1") * MEMORY_HEADROOM_PERCENT / 100))
+    available=$(available_memory_bytes)
+    [ "$available" -gt "$needed" ] || fail "not enough free memory to load the backup: need ~${needed} bytes, have ${available}"
+}
+
+scratch() {
+    env -u VALKEYCLI_AUTH valkey-cli -s "$workdir/valkey.sock" "$@" 2>/dev/null | tr -d '\r'
+}
+
+start_scratch_server() {
+    valkey-server --port 0 --unixsocket "$workdir/valkey.sock" --unixsocketperm 700 --dir "$workdir" \
+        --dbfilename dump.rdb --save "" --appendonly no --io-threads 1 --loglevel warning \
+        > "$workdir/server.log" 2>&1 &
+    server_pid=$!
+}
+
+wait_until_loaded() {
+    started=$(date -u +%s)
+    until [ "$(scratch PING)" = "PONG" ]; do
+        kill -0 "$server_pid" 2>/dev/null || fail "scratch server exited while loading: $(tail -n 3 "$workdir/server.log")"
+        [ "$(($(date -u +%s) - started))" -lt "$BACKUP_SNAPSHOT_TIMEOUT" ] || fail "backup still loading after ${BACKUP_SNAPSHOT_TIMEOUT}s"
+        sleep 1
+    done
+}
+
+loaded_keys() {
+    scratch INFO keyspace | sed -n 's/^db[0-9]*:keys=\([0-9]*\).*/\1/p' | awk '{ total += $1 } END { print total + 0 }'
+}
+
+require_keys_kept() {
+    recorded=$(s3_recorded_keys "$1")
+    [ -n "$recorded" ] || return 0
+    [ "$2" -ge "$((recorded * MINIMUM_KEPT_PERCENT / 100))" ] || fail "$1 loaded $2 keys but $recorded were recorded at backup time"
+}
+
+cleanup() {
+    [ -n "${server_pid:-}" ] && kill "$server_pid" 2>/dev/null
+    rm -rf "$workdir"
+}
+
+main() {
+    validate_backup_env
+    name=$(newest_backup) || fail "cannot list backups in s3"
+    [ -n "$name" ] || fail "no backups under s3://$S3_BUCKET/$BACKUP_PATH/"
+
+    workdir=$(mktemp -d "$BACKUP_TMP_DIR/backup.XXXXXX")
+    trap cleanup EXIT
+
+    download_backup "$name" "$workdir/archive" || fail "$name failed verification"
+    unpack_snapshot "$workdir/archive" "$workdir/dump.rdb" "$name" || fail "$name failed verification"
+    rm -f "$workdir/archive"
+    require_memory_for "$workdir/dump.rdb"
+
+    start_scratch_server
+    wait_until_loaded
+    keys=$(loaded_keys)
+    require_keys_kept "$name" "$keys"
+    log "restore check passed: $name loaded $keys keys"
+}
+
+main

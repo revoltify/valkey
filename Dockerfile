@@ -5,7 +5,7 @@ RUN apk add --no-cache curl~8.22 haproxy~3.4 jq~1.8 socat~1.8 su-exec~0.3 tini~0
 
 COPY valkey.conf /usr/local/etc/valkey/valkey.conf
 COPY lib/ /usr/local/lib/valkey-backup/
-COPY --chmod=755 bin/entrypoint bin/sentinel-entrypoint bin/primary-probe bin/primary-status bin/tls-proxy bin/generate-certs bin/backup bin/restore-latest bin/healthcheck /usr/local/bin/
+COPY --chmod=755 bin/entrypoint bin/sentinel-entrypoint bin/primary-probe bin/primary-status bin/tls-proxy bin/generate-certs bin/watchdog bin/backup bin/restore-latest bin/restore-check bin/healthcheck /usr/local/bin/
 
 ENV VALKEY_CONFIG_SAVE="3600 1" \
     VALKEY_MAXMEMORY_PERCENT=70 \
@@ -21,7 +21,12 @@ ENV VALKEY_CONFIG_SAVE="3600 1" \
     VALKEY_INITIAL_PRIMARY=false \
     PRIMARY_PROBE_PORT=8080 \
     TLS_PROXY_PORT=6380 \
-    TLS_CLIENT_VERIFY=required
+    TLS_CLIENT_VERIFY=required \
+    WATCHDOG_INTERVAL_SECONDS=30 \
+    ALERT_REPEAT_HOURS=6 \
+    ALERT_MEMORY_PERCENT=80 \
+    ALERT_DISK_PERCENT=80 \
+    RESTORE_CHECK_INTERVAL_DAYS=7
 
 VOLUME /data
 EXPOSE 6379 6380 26379 8080

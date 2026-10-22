@@ -82,7 +82,7 @@ main() {
 
     require_space_for "$DATA_DIR/dump.rdb"
     gzip -c "$DATA_DIR/dump.rdb" > "$workdir/$name"
-    s3_upload "$workdir/$name" "$name" || fail "upload of $name failed"
+    s3_upload "$workdir/$name" "$name" "$keys" || fail "upload of $name failed"
     log "uploaded $name ($(du -h "$workdir/$name" | cut -f 1), $keys keys)"
     prune_old_backups
 }

@@ -2,33 +2,22 @@
 set -eu
 
 . /usr/local/lib/valkey-backup/common.sh
+. /usr/local/lib/valkey-backup/restore.sh
 
 newest_first() {
     sort -r
 }
 
-archive_is_valid() {
-    expected=$(s3_expected_sha256 "$1")
-    if [ -n "$expected" ] && [ "$(sha256_of "$2")" != "$expected" ]; then
-        log "$1 checksum mismatch"
-        return 1
-    fi
-    gzip -t "$2" 2>/dev/null || { log "$1 is not a valid gzip archive"; return 1; }
-}
-
 install_snapshot() {
     staging="$DATA_DIR/dump.rdb.restoring"
-    gunzip -c "$1" > "$staging" || { log "could not unpack into $DATA_DIR"; return 1; }
-    valkey-check-rdb "$staging" > /dev/null 2>&1 || { log "$2 is not a valid RDB snapshot"; rm -f "$staging"; return 1; }
+    unpack_snapshot "$1" "$staging" "$2" || { rm -f "$staging"; return 1; }
     fsync "$staging" || return 1
     mv "$staging" "$DATA_DIR/dump.rdb" || return 1
     fsync "$DATA_DIR"
 }
 
 restore() {
-    log "downloading $1"
-    s3_download "$1" "$workdir/archive" || { log "download of $1 failed"; return 1; }
-    archive_is_valid "$1" "$workdir/archive" || return 1
+    download_backup "$1" "$workdir/archive" || return 1
     install_snapshot "$workdir/archive" "$1" || return 1
     log "restored $1"
 }

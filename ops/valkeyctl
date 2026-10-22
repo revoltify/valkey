@@ -1,0 +1,1143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OPS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_DIR=$(dirname "$OPS_DIR")
+CLUSTERS_DIR=${VALKEYCTL_CLUSTERS_DIR:-$OPS_DIR/clusters}
+DEFAULT_IMAGE=ghcr.io/revoltify/valkey:latest
+REMOTE_DIR=/srv/valkey
+NODE_ENV_PASSTHROUGH='^(S3_[A-Z_]+|BACKUP_[A-Z_]+|RESTORE_[A-Z_]+|ALERT_[A-Z_]+|WATCHDOG_[A-Z_]+|HEARTBEAT_URL|TLS_CLIENT_VERIFY|VALKEY_MAXMEMORY_PERCENT)$'
+IPV4='([0-9]{1,3}\.){3}[0-9]{1,3}'
+FAILOVER_TEST_SETTLE_SECONDS=10
+
+YES=false
+CLUSTER=
+INVENTORY=
+TLS_LOCAL_DIR=
+EXIT_HOOKS=
+SCRATCH=
+CLIENT_CERT_VARS=()
+
+usage() {
+    cat <<'EOF'
+usage: valkeyctl [--yes] <command> <cluster> [arguments]
+
+  init <cluster>                                   provision every node in the inventory and start the group
+  status <cluster>                                 roles, replication, memory, containers, Sentinel and TLS
+  add-node <cluster> <name> <public>/<private>     join a new replica
+  remove-node <cluster> <name>                     retire a replica (keeps its data directory)
+  replace-node <cluster> <old> <new> <public>/<private>
+  failover <cluster>                               move the primary role to a replica
+  upgrade <cluster> [tag]                          rolling image upgrade: replicas, failover, old primary
+  rotate-certs <cluster> [--client]                reissue the server (and client) certificate from the local CA
+  test-failover <cluster>                          stop the primary under write load and measure the impact
+  backup-now <cluster>                             run the image's backup on the current primary
+  restore-check <cluster>                          verify the latest backup restores, on the current primary
+
+Inventory: ops/clusters/<cluster>.env (NODES, SSH_USER, IMAGE, TLS_NAMES, VALKEY_PASSWORD).
+EOF
+}
+
+log() {
+    printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+on_exit() {
+    EXIT_HOOKS="$*; $EXIT_HOOKS"
+}
+
+run_exit_hooks() {
+    [ -n "$EXIT_HOOKS" ] || return 0
+    eval "$EXIT_HOOKS" || true
+}
+
+create_scratch_dir() {
+    SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/valkeyctl.XXXXXX")
+    on_exit "rm -rf '$SCRATCH'"
+}
+
+confirm() {
+    printf '\nPlan for cluster %s:\n' "$CLUSTER" >&2
+    printf '  - %s\n' "$@" >&2
+    [ "$YES" = true ] && return 0
+    local answer
+    { : </dev/tty; } 2>/dev/null || die "no terminal to confirm on, rerun with --yes"
+    read -r -p 'Proceed? [y/N] ' answer </dev/tty || die "no terminal to confirm on, rerun with --yes"
+    case "$answer" in
+        y | Y | yes) ;;
+        *) die "aborted" ;;
+    esac
+}
+
+lock_cluster() {
+    local lock="$CLUSTERS_DIR/.$CLUSTER.lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+        local holder
+        holder=$(cat "$lock/pid" 2>/dev/null || true)
+        [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && die "cluster $CLUSTER is locked by valkeyctl pid $holder"
+        log "removing stale lock left by pid ${holder:-unknown}"
+        rm -rf "$lock"
+        mkdir "$lock"
+    fi
+    printf '%s\n' "$$" > "$lock/pid"
+    on_exit "rm -rf '$lock'"
+}
+
+wait_until() {
+    local description=$1 timeout=$2
+    shift 2
+    local deadline=$((SECONDS + timeout))
+    log "waiting for $description"
+    until "$@"; do
+        [ "$SECONDS" -lt "$deadline" ] || die "timed out after ${timeout}s waiting for $description"
+        sleep 2
+    done
+}
+
+require_local_tools() {
+    local tool
+    for tool in ssh awk sed paste openssl; do
+        command -v "$tool" >/dev/null || die "$tool is required on this machine"
+    done
+}
+
+load_inventory() {
+    [ -n "${1:-}" ] || { usage >&2; exit 2; }
+    [[ $1 =~ ^[A-Za-z0-9_-]+$ ]] || die "cluster name must be letters, digits, _ or -"
+    CLUSTER=$1
+    INVENTORY="$CLUSTERS_DIR/$CLUSTER.env"
+    TLS_LOCAL_DIR="$CLUSTERS_DIR/$CLUSTER-tls"
+    [ -f "$INVENTORY" ] || die "no inventory at $INVENTORY"
+    # shellcheck disable=SC1090
+    source "$INVENTORY"
+    SSH_USER=${SSH_USER:-root}
+    IMAGE=${IMAGE:-$DEFAULT_IMAGE}
+    TLS_NAMES=${TLS_NAMES:-}
+    NODES=${NODES:-}
+    VALKEY_PASSWORD=${VALKEY_PASSWORD:-}
+    [ -n "$NODES" ] || die "NODES is empty in $INVENTORY"
+    validate_nodes
+}
+
+validate_nodes() {
+    local entry
+    for entry in $NODES; do
+        validate_node_name "${entry%%=*}"
+        validate_address "${entry#*=}"
+    done
+    [ "$(node_names | sort -u | wc -l)" -eq "$(node_count)" ] || die "duplicate node names in NODES"
+    [ "$(private_ips | sort -u | wc -l)" -eq "$(node_count)" ] || die "duplicate private IPs in NODES"
+}
+
+validate_node_name() {
+    [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "node name '$1' must be lowercase letters, digits and -"
+}
+
+validate_address() {
+    [[ $1 =~ ^$IPV4/$IPV4$ ]] || die "node address '$1' must be <public-ip>/<private-ip>"
+}
+
+set_inventory_var() {
+    local name=$1 value=$2 tmp
+    tmp=$(mktemp "$INVENTORY.XXXXXX")
+    awk -v name="$name" -v line="$name=\"$value\"" '
+        index($0, name "=") == 1 { print line; written = 1; next }
+        { print }
+        END { if (!written) print line }
+    ' "$INVENTORY" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$INVENTORY"
+    printf -v "$name" '%s' "$value"
+}
+
+node_names() {
+    local entry
+    for entry in $NODES; do
+        printf '%s\n' "${entry%%=*}"
+    done
+}
+
+node_count() {
+    local entries
+    read -r -a entries <<<"$NODES"
+    printf '%s' "${#entries[@]}"
+}
+
+first_node() {
+    local entries
+    read -r -a entries <<<"$NODES"
+    printf '%s' "${entries[0]%%=*}"
+}
+
+has_node() {
+    node_names | grep -qx "$1"
+}
+
+address_of() {
+    local entry
+    for entry in $NODES; do
+        [ "${entry%%=*}" = "$1" ] && { printf '%s' "${entry#*=}"; return 0; }
+    done
+    die "unknown node $1"
+}
+
+public_ip_of() {
+    local address
+    address=$(address_of "$1")
+    printf '%s' "${address%%/*}"
+}
+
+private_ip_of() {
+    local address
+    address=$(address_of "$1")
+    printf '%s' "${address#*/}"
+}
+
+private_ips() {
+    local node
+    for node in $(node_names); do
+        printf '%s\n' "$(private_ip_of "$node")"
+    done
+}
+
+node_at() {
+    local node
+    for node in $(node_names); do
+        [ "$(private_ip_of "$node")" = "$1" ] && { printf '%s' "$node"; return 0; }
+    done
+    return 1
+}
+
+nodes_except() {
+    node_names | grep -vx "$1" || true
+}
+
+sentinel_hosts_csv() {
+    private_ips | paste -sd , -
+}
+
+majority_of() {
+    printf '%s' "$(($1 / 2 + 1))"
+}
+
+nodes_without() {
+    local entry kept=
+    for entry in $NODES; do
+        [ "${entry%%=*}" = "$1" ] || kept="$kept $entry"
+    done
+    printf '%s' "${kept# }"
+}
+
+ssh_to() {
+    local node=$1
+    shift
+    ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+        "$SSH_USER@$(public_ip_of "$node")" "$@"
+}
+
+remote_prelude() {
+    cat <<'EOS'
+set -euo pipefail
+VALKEY_DIR=/srv/valkey
+TLS_DIR=$VALKEY_DIR/tls
+VALKEY_UID=999
+in_container() {
+    local container=$1
+    shift
+    docker exec "$container" sh -c 'VALKEYCLI_AUTH=$VALKEY_PASSWORD exec valkey-cli "$@"' valkey-cli "$@" </dev/null | tr -d '\r'
+}
+vcli() { in_container valkey-valkey-1 "$@"; }
+scli() { in_container valkey-sentinel-1 -p 26379 "$@"; }
+sentinel_at() { local host=$1; shift; scli -h "$host" "$@"; }
+info_field() { vcli INFO "$1" | sed -n "s/^$2://p"; }
+compose() { (cd "$VALKEY_DIR" && docker compose --profile ha "$@" </dev/null); }
+write_file() {
+    local path=$1 mode=$2 tmp
+    tmp=$(mktemp "$path.XXXXXX")
+    chmod "$mode" "$tmp"
+    printf '%s\n' "$3" > "$tmp"
+    mv "$tmp" "$path"
+}
+set_env_key() {
+    local file=$VALKEY_DIR/.env
+    if grep -q "^$1=" "$file"; then
+        sed -i "s|^$1=.*|$1=$2|" "$file"
+        return
+    fi
+    printf '%s=%s\n' "$1" "$2" >> "$file"
+}
+private_ip() { sed -n 's/^VALKEY_PRIVATE_IP=//p' "$VALKEY_DIR/.env"; }
+image_in_use() {
+    docker inspect -f '{{.Config.Image}}' valkey-proxy-1 2>/dev/null && return
+    sed -n 's/^ *image: *//p' "$VALKEY_DIR/compose.yaml" | head -n 1
+}
+write_client_certs() {
+    install -d -m 700 "$1"
+    write_file "$1/ca.crt" 644 "$CA_CRT"
+    write_file "$1/client.crt" 644 "$CLIENT_CRT"
+    write_file "$1/client.key" 600 "$CLIENT_KEY"
+}
+tls_cli() {
+    local dir=$1
+    shift
+    docker run --rm --network host --env-file "$VALKEY_DIR/.env" -v "$dir:/client:ro" --entrypoint sh "$(image_in_use)" \
+        -c 'VALKEYCLI_AUTH=$VALKEY_PASSWORD exec valkey-cli --tls --cacert /client/ca.crt --cert /client/client.crt --key /client/client.key "$@"' \
+        valkey-cli "$@" </dev/null 2>&1 | tr -d '\r'
+}
+recreate_endpoints() {
+    local services
+    services=$(compose config --services | grep -x -e proxy -e watchdog | paste -sd ' ' -)
+    [ -n "$services" ] || return 0
+    compose up -d --no-deps --force-recreate $services
+}
+EOS
+}
+
+remote_variables() {
+    local pair
+    for pair in "$@"; do
+        printf '%s=%q\n' "${pair%%=*}" "${pair#*=}"
+    done
+}
+
+on() {
+    local node=$1
+    shift
+    { remote_prelude; remote_variables "$@"; cat; } | ssh_to "$node" 'bash -c "$(cat)"'
+}
+
+run_on() {
+    on "$1" <<<"$2"
+}
+
+load_client_cert_vars() {
+    CLIENT_CERT_VARS=()
+    [ -s "$TLS_LOCAL_DIR/client.key" ] || return 0
+    CLIENT_CERT_VARS=("CA_CRT=$(cat "$TLS_LOCAL_DIR/ca.crt")" "CLIENT_CRT=$(cat "$TLS_LOCAL_DIR/client.crt")" "CLIENT_KEY=$(cat "$TLS_LOCAL_DIR/client.key")")
+}
+
+require_client_certs() {
+    [ -s "$TLS_LOCAL_DIR/client.key" ] || die "client certificates missing in $TLS_LOCAL_DIR (ca.crt, client.crt, client.key)"
+}
+
+require_reachable() {
+    local node
+    for node in "$@"; do
+        ssh_to "$node" true </dev/null 2>/dev/null || die "cannot reach $node ($SSH_USER@$(public_ip_of "$node")) over SSH"
+    done
+}
+
+preflight() {
+    require_local_tools
+    load_inventory "$1"
+    # shellcheck disable=SC2046
+    require_reachable $(node_names)
+}
+
+view_node() {
+    local node
+    for node in $(node_names); do
+        [ "$node" = "${1:-}" ] || { printf '%s' "$node"; return; }
+    done
+}
+
+cluster_view() {
+    on "$1" HOSTS="$(private_ips | paste -sd ' ' -)" <<'EOS'
+for host in $HOSTS; do
+    code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://$host:8080/" || true)
+    printf 'probe %s %s\n' "$host" "$code"
+    printf 'sentinel %s %s\n' "$host" "$(sentinel_at "$host" SENTINEL get-master-addr-by-name main 2>/dev/null | head -n 1 || true)"
+done
+EOS
+}
+
+agreed_primary_ip() {
+    local view probes answered
+    view=$(cluster_view "$(view_node "${1:-}")") || return 1
+    probes=$(awk '$1 == "probe" && $3 == "200" { print $2 }' <<<"$view")
+    [ -n "$probes" ] && [ "$(wc -l <<<"$probes")" -eq 1 ] || return 1
+    answered=$(awk '$1 == "sentinel" && NF == 3 { print $3 }' <<<"$view")
+    [ "$(wc -l <<<"$answered")" -ge "$(majority_of "$(node_count)")" ] || return 1
+    [ "$(sort -u <<<"$answered")" = "$probes" ] || return 1
+    printf '%s' "$probes"
+}
+
+primary_node() {
+    local ip
+    ip=$(agreed_primary_ip "${1:-}") || die "probes and Sentinels do not agree on one primary, check 'valkeyctl status $CLUSTER'"
+    node_at "$ip" || die "primary $ip is not in the inventory"
+}
+
+primary_moved_from() {
+    local ip
+    ip=$(agreed_primary_ip "$1") || return 1
+    [ "$ip" != "$(private_ip_of "$1")" ]
+}
+
+replication_field_is() {
+    [ "$(run_on "$1" "info_field replication $2" 2>/dev/null)" = "$3" ]
+}
+
+replica_in_sync() {
+    replication_field_is "$1" role slave && replication_field_is "$1" master_link_status up
+}
+
+wait_for_replica() {
+    wait_until "$1 to replicate (master_link_status:up)" 300 replica_in_sync "$1"
+}
+
+sentinel_sees_group() {
+    local expected=$(($(node_count) - 1)) view
+    view=$(run_on "$1" "scli SENTINEL master main | paste - -" 2>/dev/null) || return 1
+    [ "$(awk '$1 == "num-slaves" { print $2 }' <<<"$view")" = "$expected" ] &&
+        [ "$(awk '$1 == "num-other-sentinels" { print $2 }' <<<"$view")" = "$expected" ]
+}
+
+image_with_tag() {
+    [ -n "${1:-}" ] || { printf '%s' "$IMAGE"; return; }
+    local repository=${IMAGE%@*}
+    [[ ${repository##*/} == *:* ]] && repository=${repository%:*}
+    printf '%s:%s' "$repository" "$1"
+}
+
+compose_for() {
+    sed -E "s|^([[:space:]]+image:).*|\1 $1|" "$REPO_DIR/compose.yaml"
+}
+
+inventory_variable_names() {
+    sed -n 's/^\([A-Z][A-Z0-9_]*\)=.*/\1/p' "$INVENTORY" | sort -u
+}
+
+passthrough_settings() {
+    local name
+    for name in $(inventory_variable_names | grep -E "$NODE_ENV_PASSTHROUGH" | grep -vx -e ALERT_NODE_NAME -e BACKUP_ENABLED -e TLS_CLIENT_VERIFY); do
+        printf '%s=%s\n' "$name" "${!name}"
+    done
+}
+
+initial_env_for() {
+    local initial_primary=false
+    [ "$1" = "$(first_node)" ] && initial_primary=true
+    cat <<EOF
+VALKEY_PASSWORD=$VALKEY_PASSWORD
+VALKEY_PRIVATE_IP=$(private_ip_of "$1")
+SENTINEL_HOSTS=$(sentinel_hosts_csv)
+VALKEY_INITIAL_PRIMARY=$initial_primary
+SENTINEL_QUORUM=$(majority_of "$(node_count)")
+TLS_CLIENT_VERIFY=${TLS_CLIENT_VERIFY:-required}
+BACKUP_ENABLED=${BACKUP_ENABLED:-false}
+ALERT_NODE_NAME=$1
+EOF
+    passthrough_settings
+}
+
+env_with() {
+    local content=$1 pair
+    shift
+    for pair in "$@"; do
+        content=$(awk -v key="${pair%%=*}" -v line="$pair" '
+            index($0, key "=") == 1 { print line; written = 1; next }
+            { print }
+            END { if (!written) print line }
+        ' <<<"$content")
+    done
+    printf '%s' "$content"
+}
+
+provision() {
+    local node=$1 env_content=$2
+    log "$node: installing Docker, tuning the host, writing $REMOTE_DIR and pulling $IMAGE"
+    on "$node" SETUP="$(cat "$REPO_DIR/host/setup")" COMPOSE="$(compose_for "$IMAGE")" ENV_CONTENT="$env_content" IMAGE="$IMAGE" <<'EOS'
+export DEBIAN_FRONTEND=noninteractive
+if ! docker compose version >/dev/null 2>&1 || ! docker buildx version >/dev/null 2>&1; then
+    apt-get update -q </dev/null
+    apt-get install -yq docker.io docker-compose-v2 docker-buildx </dev/null
+fi
+printf '%s\n' "$SETUP" | sh -s
+install -d -m 755 "$VALKEY_DIR" "$TLS_DIR"
+write_file "$VALKEY_DIR/compose.yaml" 644 "$COMPOSE"
+write_file "$VALKEY_DIR/.env" 600 "$ENV_CONTENT"
+docker pull -q "$IMAGE" </dev/null
+EOS
+}
+
+refuse_if_deployed() {
+    local node
+    for node in "$@"; do
+        run_on "$node" 'docker container inspect valkey-valkey-1 >/dev/null 2>&1 && exit 1 || exit 0' ||
+            die "$node already runs valkey-valkey-1; init is for new nodes only"
+    done
+}
+
+install_server_cert() {
+    on "$1" CA="$2" SERVER_PEM="$3" <<'EOS'
+install -d -m 755 "$TLS_DIR"
+write_file "$TLS_DIR/ca.crt" 644 "$CA"
+write_file "$TLS_DIR/server.pem" 600 "$SERVER_PEM"
+chown "$VALKEY_UID" "$TLS_DIR/ca.crt" "$TLS_DIR/server.pem"
+EOS
+}
+
+fetch_remote_file() {
+    ssh_to "$1" cat "$2" </dev/null
+}
+
+save_local_tls_file() {
+    (umask 077 && fetch_remote_file "$1" "$REMOTE_DIR/tls/$2" > "$TLS_LOCAL_DIR/$2")
+}
+
+certificate_names() {
+    printf '%s %s' "$TLS_NAMES" "$(private_ips | paste -sd ' ' -)"
+}
+
+generate_initial_certs() {
+    local node=$1 file
+    log "$node: generating CA, server and client certificates for: $(certificate_names)"
+    on "$node" IMAGE="$IMAGE" NAMES="$(certificate_names)" <<'EOS'
+install -d -m 755 "$TLS_DIR"
+read -r -a names <<<"$NAMES"
+docker run --rm -v "$TLS_DIR:/certs" --entrypoint generate-certs "$IMAGE" "${names[@]}" </dev/null
+EOS
+    mkdir -p "$TLS_LOCAL_DIR"
+    chmod 700 "$TLS_LOCAL_DIR"
+    for file in ca.crt client.crt client.key ca.key; do
+        save_local_tls_file "$node" "$file"
+    done
+    run_on "$node" 'rm -f "$TLS_DIR/ca.key" "$TLS_DIR/ca.srl" "$TLS_DIR/client.key"'
+    log "saved ca.crt, client.crt, client.key and ca.key to $TLS_LOCAL_DIR (ca.key removed from $node)"
+}
+
+copy_server_cert() {
+    local from=$1 to=$2
+    install_server_cert "$to" "$(fetch_remote_file "$from" "$REMOTE_DIR/tls/ca.crt")" "$(fetch_remote_file "$from" "$REMOTE_DIR/tls/server.pem")"
+}
+
+start_node() {
+    log "$1: docker compose --profile ha up -d"
+    run_on "$1" 'compose up -d --quiet-pull'
+}
+
+ensure_password() {
+    [ -n "$VALKEY_PASSWORD" ] && return 0
+    set_inventory_var VALKEY_PASSWORD "$(openssl rand -hex 32)"
+    log "generated VALKEY_PASSWORD and stored it in $INVENTORY"
+}
+
+cmd_init() {
+    preflight "${1:-}"
+    local first node
+    first=$(first_node)
+    # shellcheck disable=SC2046
+    refuse_if_deployed $(node_names)
+    [ -n "$TLS_NAMES" ] || log "warning: TLS_NAMES is empty, the certificate will only cover private IPs"
+    confirm "install docker.io docker-compose-v2 docker-buildx and run host/setup on: $(node_names | paste -sd ' ' -)" \
+        "write $REMOTE_DIR/compose.yaml and .env (mode 600), image $IMAGE, quorum $(majority_of "$(node_count)")" \
+        "generate certificates on $first for: $(certificate_names), download them to $TLS_LOCAL_DIR" \
+        "start $first as the initial primary, then the others as replicas"
+    lock_cluster
+    ensure_password
+    for node in $(node_names); do
+        provision "$node" "$(initial_env_for "$node")"
+    done
+    generate_initial_certs "$first"
+    for node in $(nodes_except "$first"); do
+        copy_server_cert "$first" "$node"
+    done
+    start_node "$first"
+    wait_until "$first to become primary" 120 replication_field_is "$first" role master
+    for node in $(nodes_except "$first"); do
+        start_node "$node"
+        wait_for_replica "$node"
+    done
+    wait_until "every Sentinel to see the whole group" 120 every_sentinel_sees_group
+    show_status
+}
+
+every_sentinel_sees_group() {
+    local node
+    for node in $(node_names); do
+        sentinel_sees_group "$node" || return 1
+    done
+}
+
+collect_node_status() {
+    load_client_cert_vars
+    on "$1" ${CLIENT_CERT_VARS[@]+"${CLIENT_CERT_VARS[@]}"} <<'EOS'
+replication=$(vcli INFO replication 2>/dev/null || true)
+memory=$(vcli INFO memory 2>/dev/null || true)
+field() { sed -n "s/^$2://p" <<<"$1"; }
+echo "role=$(field "$replication" role)"
+echo "link=$(field "$replication" master_link_status)"
+echo "used=$(field "$memory" used_memory)"
+echo "max=$(field "$memory" maxmemory)"
+echo "replicas=$(sed -n 's/^slave[0-9]*:ip=\([^,]*\),.*state=\([^,]*\),.*lag=\([0-9]*\).*/\1:\2:\3/p' <<<"$replication" | paste -sd ' ' -)"
+echo "containers=$(docker ps -a --filter label=com.docker.compose.project=valkey --format '{{.Label "com.docker.compose.service"}}:{{.State}}' | sort | paste -sd ' ' -)"
+scli SENTINEL master main 2>/dev/null | paste - - | awk -F '\t' '$1 ~ /^(ip|num-slaves|num-other-sentinels|quorum|flags)$/ { print "sentinel_" $1 "=" $2 }' || true
+if [ -z "${CLIENT_KEY:-}" ]; then
+    echo "tls=no-client-certs"
+    exit 0
+fi
+dir=$(mktemp -d)
+trap 'rm -rf "$dir"' EXIT
+write_client_certs "$dir"
+echo "tls=$(tls_cli "$dir" -h "$(private_ip)" -p 6380 PING | tail -n 1)"
+EOS
+}
+
+status_field() {
+    awk -v key="$2" 'index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }' "$1"
+}
+
+collect_cluster_status() {
+    local dir=$1 node
+    for node in $(node_names); do
+        { collect_node_status "$node" || echo "unreachable=1"; } > "$dir/$node" 2>/dev/null &
+    done
+    wait
+}
+
+memory_percent() {
+    [ -n "$1" ] && [ -n "$2" ] && [ "$2" -gt 0 ] || { printf -- '-'; return; }
+    printf '%s%%' "$(($1 * 100 / $2))"
+}
+
+replica_lag() {
+    local primary_file=$1 ip=$2 entry
+    [ -n "$primary_file" ] || { printf -- '-'; return; }
+    for entry in $(status_field "$primary_file" replicas); do
+        [ "${entry%%:*}" = "$ip" ] && { printf '%ss' "${entry##*:}"; return; }
+    done
+    printf -- '-'
+}
+
+primary_status_file() {
+    local dir=$1 node
+    for node in $(node_names); do
+        [ "$(status_field "$dir/$node" role)" = master ] && { printf '%s' "$dir/$node"; return; }
+    done
+    return 0
+}
+
+render_node_table() {
+    local dir=$1 primary_file node file
+    primary_file=$(primary_status_file "$dir")
+    printf '%-12s %-15s %-15s %-8s %-6s %-5s %-5s %-6s %s\n' NODE PUBLIC PRIVATE ROLE LINK LAG MEM TLS CONTAINERS
+    for node in $(node_names); do
+        file="$dir/$node"
+        if [ -n "$(status_field "$file" unreachable)" ]; then
+            printf '%-12s %-15s %-15s %s\n' "$node" "$(public_ip_of "$node")" "$(private_ip_of "$node")" UNREACHABLE
+            continue
+        fi
+        printf '%-12s %-15s %-15s %-8s %-6s %-5s %-5s %-6s %s\n' "$node" "$(public_ip_of "$node")" "$(private_ip_of "$node")" \
+            "$(status_field "$file" role)" "$(status_field "$file" link)" "$(replica_lag "$primary_file" "$(private_ip_of "$node")")" \
+            "$(memory_percent "$(status_field "$file" used)" "$(status_field "$file" max)")" \
+            "$(status_field "$file" tls)" "$(status_field "$file" containers)"
+    done
+}
+
+render_sentinel_table() {
+    local dir=$1 node file ip
+    printf '\n%-12s %-24s %-10s %-15s %-6s %s\n' SENTINEL PRIMARY NUM-SLAVES OTHER-SENTINELS QUORUM FLAGS
+    for node in $(node_names); do
+        file="$dir/$node"
+        ip=$(status_field "$file" sentinel_ip)
+        printf '%-12s %-24s %-10s %-15s %-6s %s\n' "$node" "${ip:--} ($(node_at "$ip" || printf '?'))" \
+            "$(status_field "$file" sentinel_num-slaves)" "$(status_field "$file" sentinel_num-other-sentinels)" \
+            "$(status_field "$file" sentinel_quorum)" "$(status_field "$file" sentinel_flags)"
+    done
+}
+
+node_problems() {
+    local file=$1 node=$2 expected=$3 container
+    [ -n "$(status_field "$file" unreachable)" ] && { echo "$node: unreachable over SSH"; return; }
+    case "$(status_field "$file" role)" in
+        master) ;;
+        slave) [ "$(status_field "$file" link)" = up ] || echo "$node: master_link_status is $(status_field "$file" link)" ;;
+        *) echo "$node: valkey does not answer" ;;
+    esac
+    for container in $(status_field "$file" containers); do
+        [ "${container#*:}" = running ] || echo "$node: container ${container%%:*} is ${container#*:}"
+    done
+    [ "$(status_field "$file" tls)" = PONG ] || echo "$node: TLS PING through the proxy failed: $(status_field "$file" tls)"
+    [ "$(status_field "$file" sentinel_num-slaves)" = "$expected" ] || echo "$node: Sentinel sees $(status_field "$file" sentinel_num-slaves) replicas, expected $expected"
+    [ "$(status_field "$file" sentinel_num-other-sentinels)" = "$expected" ] || echo "$node: Sentinel sees $(status_field "$file" sentinel_num-other-sentinels) other Sentinels, expected $expected"
+    [ "$(status_field "$file" sentinel_quorum)" = "$(majority_of "$(node_count)")" ] || echo "$node: Sentinel quorum is $(status_field "$file" sentinel_quorum), expected $(majority_of "$(node_count)")"
+}
+
+cluster_problems() {
+    local dir=$1 node primaries sentinel_views
+    primaries=$(cat "$dir"/* | grep -cx 'role=master' || true)
+    [ "$primaries" -eq 1 ] || echo "cluster: $primaries nodes report role:master, expected 1"
+    sentinel_views=$(cat "$dir"/* | grep '^sentinel_ip=' | sort -u | wc -l | tr -d ' ')
+    [ "$sentinel_views" -le 1 ] || echo "cluster: Sentinels disagree on the primary"
+    for node in $(node_names); do
+        node_problems "$dir/$node" "$node" "$(($(node_count) - 1))"
+    done
+}
+
+show_status() {
+    local dir problems
+    dir="$SCRATCH/status"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    collect_cluster_status "$dir"
+    render_node_table "$dir"
+    render_sentinel_table "$dir"
+    problems=$(cluster_problems "$dir")
+    if [ -z "$problems" ]; then
+        printf '\nhealthy\n'
+        return 0
+    fi
+    printf '\nproblems:\n' >&2
+    awk '{ print "  " $0 }' <<<"$problems" >&2
+    return 1
+}
+
+cmd_status() {
+    require_local_tools
+    load_inventory "${1:-}"
+    [ -s "$TLS_LOCAL_DIR/client.key" ] || log "warning: no client certificates in $TLS_LOCAL_DIR, skipping TLS checks"
+    show_status
+}
+
+fail_over_from() {
+    local old=$1
+    local reply
+    log "SENTINEL FAILOVER main (primary is $old)"
+    reply=$(run_on "$(view_node "$old")" 'scli SENTINEL FAILOVER main')
+    [ "$reply" = OK ] || die "SENTINEL FAILOVER refused: $reply"
+    wait_until "probes and Sentinels to agree on a primary other than $old" 120 primary_moved_from "$old"
+    log "primary is now $(primary_node)"
+}
+
+cmd_failover() {
+    preflight "${1:-}"
+    local primary
+    primary=$(primary_node)
+    [ "$(node_count)" -ge 2 ] || die "need at least one replica to fail over to"
+    confirm "SENTINEL FAILOVER main, moving the primary away from $primary" \
+        "wait until exactly one probe on :8080 answers 200 and every Sentinel agrees"
+    lock_cluster
+    fail_over_from "$primary"
+}
+
+pull_image_on() {
+    log "$1: pulling $2"
+    on "$1" IMAGE="$2" <<<'docker pull -q "$IMAGE" </dev/null >/dev/null'
+}
+
+upgrade_node() {
+    local node=$1 image=$2
+    log "$node: writing compose.yaml for $image and recreating changed containers"
+    on "$node" COMPOSE="$(compose_for "$image")" <<'EOS'
+write_file "$VALKEY_DIR/compose.yaml" 644 "$COMPOSE"
+compose up -d
+EOS
+}
+
+cmd_upgrade() {
+    preflight "${1:-}"
+    local image primary node
+    image=$(image_with_tag "${2:-}")
+    primary=$(primary_node)
+    confirm "pull $image on every node" \
+        "replicas one at a time: write compose.yaml from this repo, docker compose up -d, wait for master_link_status:up ($(nodes_except "$primary" | paste -sd ' ' -))" \
+        "SENTINEL FAILOVER away from $primary, then upgrade $primary the same way" \
+        "set IMAGE=$image in $INVENTORY"
+    lock_cluster
+    for node in $(node_names); do
+        pull_image_on "$node" "$image"
+    done
+    for node in $(nodes_except "$primary"); do
+        upgrade_node "$node" "$image"
+        wait_for_replica "$node"
+    done
+    fail_over_from "$primary"
+    upgrade_node "$primary" "$image"
+    wait_for_replica "$primary"
+    set_inventory_var IMAGE "$image"
+    show_status
+}
+
+update_membership_on() {
+    log "$1: SENTINEL_HOSTS=$2 SENTINEL_QUORUM=$3, recreating proxy and watchdog"
+    on "$1" HOSTS="$2" QUORUM="$3" <<'EOS'
+set_env_key SENTINEL_HOSTS "$HOSTS"
+set_env_key SENTINEL_QUORUM "$QUORUM"
+recreate_endpoints
+scli SENTINEL SET main quorum "$QUORUM" >/dev/null
+EOS
+}
+
+update_membership() {
+    local skip=${1:-} hosts quorum node
+    hosts=$(sentinel_hosts_csv)
+    quorum=$(majority_of "$(node_count)")
+    for node in $(node_names); do
+        [ "$node" = "$skip" ] && continue
+        update_membership_on "$node" "$hosts" "$quorum"
+    done
+}
+
+template_env_for() {
+    local name=$1 private=$2 template
+    template=$(fetch_remote_file "$3" "$REMOTE_DIR/.env")
+    [ -n "$template" ] || die "could not read $REMOTE_DIR/.env on $3"
+    env_with "$template" "VALKEY_PRIVATE_IP=$private" "VALKEY_INITIAL_PRIMARY=false" "ALERT_NODE_NAME=$name" \
+        "SENTINEL_HOSTS=$(sentinel_hosts_csv)" "SENTINEL_QUORUM=$(majority_of "$(node_count)")"
+}
+
+validate_new_node() {
+    local name=$1 address=$2
+    validate_node_name "$name"
+    validate_address "$address"
+    has_node "$name" && die "$name is already in the inventory"
+    private_ips | grep -qx "${address#*/}" && die "${address#*/} is already used by $(node_at "${address#*/}")"
+    return 0
+}
+
+plan_add_node() {
+    printf '%s\n' "install Docker and run host/setup on $1 (${2%%/*}), write $REMOTE_DIR from $3's .env with VALKEY_PRIVATE_IP=${2#*/}" \
+        "copy ca.crt and server.pem from $3, start $1 as a replica, wait for master_link_status:up" \
+        "add $1 to NODES, then on every other node: update SENTINEL_HOSTS/SENTINEL_QUORUM, recreate proxy (brief reconnect), SENTINEL SET quorum"
+}
+
+add_node() {
+    local name=$1 address=$2 template=$3 env_content
+    NODES="$NODES $name=$address"
+    env_content=$(template_env_for "$name" "${address#*/}" "$template")
+    provision "$name" "$env_content"
+    copy_server_cert "$template" "$name"
+    start_node "$name"
+    wait_for_replica "$name"
+    set_inventory_var NODES "$NODES"
+    update_membership "$name"
+    wait_until "every Sentinel to see $(node_count) nodes" 120 every_sentinel_sees_group
+    log "$name joined; tag the droplet 'valkey' so the load balancer and Cloud Firewall include it"
+    log "the server certificate does not list ${address#*/}; run rotate-certs if VPC clients connect to it by IP"
+}
+
+cmd_add_node() {
+    preflight "${1:-}"
+    local name=${2:-} address=${3:-} template
+    [ -n "$name" ] && [ -n "$address" ] || die "usage: valkeyctl add-node <cluster> <name> <public>/<private>"
+    validate_new_node "$name" "$address"
+    NODES="$NODES $name=$address"
+    require_reachable "$name"
+    NODES=$(nodes_without "$name")
+    template=$(primary_node)
+    local plan=() line
+    while IFS= read -r line; do plan+=("$line"); done < <(plan_add_node "$name" "$address" "$template")
+    confirm "${plan[@]}"
+    lock_cluster
+    add_node "$name" "$address" "$template"
+    show_status
+}
+
+stop_node() {
+    log "$1: docker compose --profile ha down (data and sentinel directories are kept)"
+    run_on "$1" 'compose down' || log "warning: could not stop $1, continuing (it may already be gone)"
+}
+
+reset_sentinels() {
+    local node
+    for node in $(node_names); do
+        log "$node: SENTINEL RESET main"
+        run_on "$node" 'scli SENTINEL RESET main >/dev/null'
+        wait_until "$node's Sentinel to rediscover the group" 120 sentinel_sees_group "$node"
+    done
+}
+
+refuse_unsafe_removal() {
+    local name=$1 primary=$2
+    has_node "$name" || die "$name is not in the inventory"
+    [ $(($(node_count) - 1)) -ge 3 ] || die "refusing: removing $name would leave fewer than 3 nodes"
+    [ "$name" != "$primary" ] || die "refusing: $name is the primary, run failover first (or use replace-node)"
+    return 0
+}
+
+plan_remove_node() {
+    printf '%s\n' "docker compose --profile ha down on $1 (its data directory is kept)" \
+        "remove $1 from NODES, then on every remaining node: update SENTINEL_HOSTS/SENTINEL_QUORUM, recreate proxy (brief reconnect)" \
+        "SENTINEL RESET main on each remaining node, one at a time"
+}
+
+remove_node() {
+    local name=$1
+    stop_node "$name"
+    NODES=$(nodes_without "$name")
+    set_inventory_var NODES "$NODES"
+    update_membership
+    reset_sentinels
+    log "$name removed; remove the droplet from the 'valkey' tag (load balancer) or destroy it"
+}
+
+cmd_remove_node() {
+    require_local_tools
+    load_inventory "${1:-}"
+    local name=${2:-} primary
+    [ -n "$name" ] || die "usage: valkeyctl remove-node <cluster> <name>"
+    has_node "$name" || die "$name is not in the inventory"
+    # shellcheck disable=SC2046
+    require_reachable $(nodes_except "$name")
+    primary=$(primary_node "$name")
+    refuse_unsafe_removal "$name" "$primary"
+    local plan=() line
+    while IFS= read -r line; do plan+=("$line"); done < <(plan_remove_node "$name")
+    confirm "${plan[@]}"
+    lock_cluster
+    remove_node "$name"
+    show_status
+}
+
+cmd_replace_node() {
+    require_local_tools
+    load_inventory "${1:-}"
+    local old=${2:-} name=${3:-} address=${4:-} primary
+    [ -n "$old" ] && [ -n "$name" ] && [ -n "$address" ] || die "usage: valkeyctl replace-node <cluster> <old> <new> <public>/<private>"
+    has_node "$old" || die "$old is not in the inventory"
+    validate_new_node "$name" "$address"
+    # shellcheck disable=SC2046
+    require_reachable $(nodes_except "$old")
+    primary=$(primary_node "$old")
+    NODES="$NODES $name=$address"
+    require_reachable "$name"
+    NODES=$(nodes_without "$name")
+    local template=$primary plan=() line
+    [ "$old" = "$primary" ] && template=$(nodes_except "$old" | head -n 1) && plan+=("SENTINEL FAILOVER away from $old (it is the primary)")
+    while IFS= read -r line; do plan+=("$line"); done < <(plan_add_node "$name" "$address" "$template")
+    while IFS= read -r line; do plan+=("$line"); done < <(plan_remove_node "$old")
+    confirm "${plan[@]}"
+    lock_cluster
+    [ "$old" != "$primary" ] || fail_over_from "$old"
+    template=$(primary_node "$old")
+    add_node "$name" "$address" "$template"
+    remove_node "$old"
+    show_status
+}
+
+backup_client_files() {
+    local stamp file
+    stamp=$(date +%Y%m%dT%H%M%S)
+    for file in client.crt client.key; do
+        [ -f "$TLS_LOCAL_DIR/$file" ] && mv "$TLS_LOCAL_DIR/$file" "$TLS_LOCAL_DIR/$file.$stamp"
+    done
+    return 0
+}
+
+issue_certs_on() {
+    local node=$1 rotate_client=$2 keep_client=()
+    [ "$rotate_client" = true ] || keep_client=("CLIENT_CRT=$(cat "$TLS_LOCAL_DIR/client.crt")")
+    on "$node" IMAGE="$(image_with_tag)" NAMES="$(certificate_names)" CA_CRT="$(cat "$TLS_LOCAL_DIR/ca.crt")" \
+        CA_KEY="$(cat "$TLS_LOCAL_DIR/ca.key")" ${keep_client[@]+"${keep_client[@]}"} <<'EOS'
+work=/root/valkeyctl-certs
+rm -rf "$work"
+install -d -m 700 "$work"
+write_file "$work/ca.crt" 644 "$CA_CRT"
+write_file "$work/ca.key" 600 "$CA_KEY"
+[ -z "${CLIENT_CRT:-}" ] || write_file "$work/client.crt" 644 "$CLIENT_CRT"
+read -r -a names <<<"$NAMES"
+docker run --rm -v "$work:/certs" --entrypoint generate-certs "$IMAGE" "${names[@]}" </dev/null
+rm -f "$work/ca.key" "$work/ca.srl"
+EOS
+}
+
+restart_proxy_on() {
+    log "$1: installing the new server.pem and restarting the proxy"
+    install_server_cert "$1" "$(cat "$TLS_LOCAL_DIR/ca.crt")" "$2"
+    run_on "$1" 'compose restart proxy >/dev/null'
+}
+
+proxy_answers_on() {
+    load_client_cert_vars
+    [ "$(on "$1" "${CLIENT_CERT_VARS[@]}" <<'EOS'
+dir=$(mktemp -d)
+trap 'rm -rf "$dir"' EXIT
+write_client_certs "$dir"
+tls_cli "$dir" -h "$(private_ip)" -p 6380 PING | tail -n 1
+EOS
+)" = PONG ]
+}
+
+cmd_rotate_certs() {
+    preflight "${1:-}"
+    local rotate_client=false issuer server_pem node
+    [ "${2:-}" = --client ] && rotate_client=true
+    [ -s "$TLS_LOCAL_DIR/ca.key" ] && [ -s "$TLS_LOCAL_DIR/ca.crt" ] || die "rotate-certs needs ca.crt and ca.key in $TLS_LOCAL_DIR"
+    require_client_certs
+    issuer=$(first_node)
+    confirm "issue a new server certificate on $issuer from the local CA for: $(certificate_names)" \
+        "$([ "$rotate_client" = true ] && echo "issue a new client certificate too (old client certs stay valid until they expire: same CA)" || echo "keep the current client certificate")" \
+        "install server.pem on every node and restart each proxy one at a time (brief reconnect per node)"
+    lock_cluster
+    issue_certs_on "$issuer" "$rotate_client"
+    server_pem=$(fetch_remote_file "$issuer" /root/valkeyctl-certs/server.pem)
+    if [ "$rotate_client" = true ]; then
+        backup_client_files
+        (umask 077 && fetch_remote_file "$issuer" /root/valkeyctl-certs/client.crt > "$TLS_LOCAL_DIR/client.crt" &&
+            fetch_remote_file "$issuer" /root/valkeyctl-certs/client.key > "$TLS_LOCAL_DIR/client.key")
+        log "new client.crt and client.key saved to $TLS_LOCAL_DIR (previous ones kept with a timestamp)"
+    fi
+    run_on "$issuer" 'rm -rf /root/valkeyctl-certs'
+    for node in $(node_names); do
+        restart_proxy_on "$node" "$server_pem"
+        wait_until "$node's proxy to answer TLS PING" 60 proxy_answers_on "$node"
+    done
+    show_status
+}
+
+start_writer() {
+    local writer=$1 key=$2
+    load_client_cert_vars
+    log "$writer: starting a writer (RPUSH $key every 0.1 s through its proxy)"
+    on "$writer" KEY="$key" "${CLIENT_CERT_VARS[@]}" <<'EOS'
+dir=/root/valkeyctl-writer
+docker rm -f valkeyctl-writer >/dev/null 2>&1 || true
+rm -rf "$dir"
+write_client_certs "$dir/client"
+docker run -d --name valkeyctl-writer --network host --env-file "$VALKEY_DIR/.env" -v "$dir/client:/client:ro" \
+    --entrypoint sleep "$(image_in_use)" infinity </dev/null >/dev/null
+cat > "$dir/loop" <<'LOOP'
+key=$1 ip=$2 dir=$3 i=0
+while [ ! -e "$dir/stop" ]; do
+    i=$((i + 1))
+    reply=$(timeout 2 docker exec valkeyctl-writer sh -c 'VALKEYCLI_AUTH=$VALKEY_PASSWORD exec valkey-cli --tls --cacert /client/ca.crt --cert /client/client.crt --key /client/client.key -h "$1" -p 6380 RPUSH "$2" "$3"' sh "$ip" "$key" "$i" </dev/null 2>&1 | tr -d '\r' | tail -n 1 || true)
+    case "$reply" in
+        '' | *[!0-9]*) result=ERR ;;
+        *) result=OK ;;
+    esac
+    printf '%s %s %s %s\n' "$(date +%s%3N)" "$i" "$result" "${reply:-timeout}" >> "$dir/log"
+    sleep 0.1
+done
+touch "$dir/stopped"
+LOOP
+setsid nohup bash "$dir/loop" "$KEY" "$(private_ip)" "$dir" </dev/null >/dev/null 2>&1 &
+EOS
+}
+
+writer_has_acknowledged_writes() {
+    run_on "$1" 'grep -q " OK " /root/valkeyctl-writer/log 2>/dev/null'
+}
+
+stop_writer() {
+    run_on "$1" 'dir=/root/valkeyctl-writer
+[ -d "$dir" ] || exit 0
+touch "$dir/stop"
+for _ in $(seq 50); do [ -e "$dir/stopped" ] && break; sleep 0.2; done
+docker rm -f valkeyctl-writer >/dev/null 2>&1 || true'
+}
+
+discard_writer() {
+    run_on "$1" 'touch /root/valkeyctl-writer/stop 2>/dev/null; docker rm -f valkeyctl-writer >/dev/null 2>&1; rm -rf /root/valkeyctl-writer' || true
+}
+
+stop_primary_container() {
+    run_on "$1" 'date +%s%3N; docker stop valkey-valkey-1 >/dev/null'
+}
+
+start_primary_container() {
+    run_on "$1" 'docker start valkey-valkey-1 >/dev/null' || true
+}
+
+failover_report() {
+    local log_file=$1 list_file=$2 stopped_at=$3 promoted_at=$4
+    awk -v stopped="$stopped_at" -v promoted="$promoted_at" -v list="$list_file" '
+        BEGIN { while ((getline value < list) > 0) stored[value] = 1 }
+        { attempts++ }
+        $3 == "OK" { acked++; if (!($2 in stored)) lost++; if ($1 > stopped && errors && !recovered) recovered = $1 }
+        $3 == "ERR" { errors++; if (!first_error) first_error = $1; last_error = $1 }
+        END {
+            printf "writes attempted:          %d\n", attempts
+            printf "acknowledged:              %d\n", acked
+            printf "failed:                    %d\n", errors
+            if (errors) printf "error window:              %.1f s (first error %.1f s after stop, last %.1f s after stop)\n", (last_error - first_error) / 1000, (first_error - stopped) / 1000, (last_error - stopped) / 1000
+            if (recovered) printf "writes recovered after:    %.1f s\n", (recovered - stopped) / 1000
+            printf "new primary agreed after:  %.1f s\n", (promoted - stopped) / 1000
+            printf "acknowledged writes lost:  %d\n", lost + 0
+        }
+    ' "$log_file"
+}
+
+cmd_test_failover() {
+    preflight "${1:-}"
+    require_client_certs
+    local primary writer key dir stopped_at promoted_at new_primary
+    primary=$(primary_node)
+    writer=$(nodes_except "$primary" | head -n 1)
+    key="valkeyctl:failover-test:$(date +%s)"
+    confirm "start a writer on $writer: RPUSH $key every 0.1 s through $writer's proxy (:6380, TLS)" \
+        "docker stop valkey-valkey-1 on the primary $primary (real clients see errors for several seconds)" \
+        "wait for a new primary, keep writing ${FAILOVER_TEST_SETTLE_SECONDS}s, stop the writer" \
+        "docker start valkey-valkey-1 on $primary, wait until it replicates, report, DEL $key"
+    lock_cluster
+    on_exit "start_primary_container '$primary'; discard_writer '$writer'"
+    dir="$SCRATCH/failover-test"
+    mkdir -p "$dir"
+    start_writer "$writer" "$key"
+    wait_until "the writer's first acknowledged write" 30 writer_has_acknowledged_writes "$writer"
+    sleep 2
+    log "$primary: docker stop valkey-valkey-1"
+    stopped_at=$(stop_primary_container "$primary")
+    wait_until "a new primary" 120 primary_moved_from "$primary"
+    promoted_at=$(run_on "$writer" 'date +%s%3N')
+    sleep "$FAILOVER_TEST_SETTLE_SECONDS"
+    stop_writer "$writer"
+    fetch_remote_file "$writer" /root/valkeyctl-writer/log > "$dir/log"
+    new_primary=$(primary_node "$primary")
+    on "$new_primary" KEY="$key" <<<'vcli LRANGE "$KEY" 0 -1' > "$dir/list"
+    log "$primary: docker start valkey-valkey-1"
+    start_primary_container "$primary"
+    wait_for_replica "$primary"
+    on "$new_primary" KEY="$key" <<<'vcli DEL "$KEY" >/dev/null'
+    discard_writer "$writer"
+    printf '\nfailover %s -> %s\n' "$primary" "$new_primary"
+    failover_report "$dir/log" "$dir/list" "$stopped_at" "$promoted_at"
+}
+
+run_on_primary() {
+    preflight "$1"
+    local primary
+    primary=$(primary_node)
+    confirm "docker exec -u valkey valkey-valkey-1 $2 on the primary $primary"
+    lock_cluster
+    log "$primary: $2"
+    on "$primary" COMMAND="$2" <<<'docker exec -u valkey valkey-valkey-1 "$COMMAND" </dev/null'
+}
+
+cmd_backup_now() {
+    run_on_primary "${1:-}" backup
+}
+
+cmd_restore_check() {
+    run_on_primary "${1:-}" restore-check
+}
+
+main() {
+    local arguments=() argument
+    for argument in "$@"; do
+        case "$argument" in
+            -y | --yes) YES=true ;;
+            *) arguments+=("$argument") ;;
+        esac
+    done
+    set -- ${arguments[@]+"${arguments[@]}"}
+    trap run_exit_hooks EXIT
+    create_scratch_dir
+    local command=${1:-help}
+    shift || true
+    case "$command" in
+        init | status | add-node | remove-node | replace-node | failover | upgrade | rotate-certs | test-failover | backup-now | restore-check)
+            "cmd_${command//-/_}" "$@"
+            ;;
+        help | -h | --help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

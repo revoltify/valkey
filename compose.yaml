@@ -34,6 +34,15 @@ services:
     healthcheck:
       disable: true
 
+  watchdog:
+    <<: *node
+    entrypoint: [/sbin/tini, --, watchdog]
+    volumes:
+      - ./data:/data
+      - ./tls:/tls:ro
+    healthcheck:
+      disable: true
+
   sentinel:
     <<: *node
     profiles: [ha]
