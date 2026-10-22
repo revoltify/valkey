@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OPS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_DIR=$(dirname "$OPS_DIR")
-CLUSTERS_DIR=${VALKEYCTL_CLUSTERS_DIR:-$OPS_DIR/clusters}
+VALKEYCTL_REF=main
+GITHUB_REPO=revoltify/valkey
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+REPO_DIR=$(dirname "$(dirname "$SCRIPT_PATH")")
+STATE_DIR=${VALKEYCTL_HOME:-$HOME/.valkeyctl}
+CLUSTERS_DIR=${VALKEYCTL_CLUSTERS_DIR:-$STATE_DIR/clusters}
 DEFAULT_IMAGE=ghcr.io/revoltify/valkey:latest
 REMOTE_DIR=/srv/valkey
 NODE_ENV_PASSTHROUGH='^(S3_[A-Z_]+|BACKUP_[A-Z_]+|RESTORE_[A-Z_]+|TLS_CLIENT_VERIFY|VALKEY_MAXMEMORY_PERCENT)$'
@@ -35,7 +38,15 @@ usage: valkeyctl [--yes] <command> <cluster> [arguments]
   test-failover <cluster>                          stop the primary under write load and measure the impact
   backup-now <cluster>                             run the image's backup on the current primary
 
-Inventory: ops/clusters/<cluster>.env (NODES, SSH_USER, IMAGE, TLS_NAMES, VALKEY_PASSWORD).
+  list                                             clusters known on this machine
+  env <cluster>                                    Laravel .env lines (host, password, certificates as base64)
+  certs <cluster> [dir]                            copy ca.crt, client.crt and client.key (default: current directory)
+  cli <cluster> <command>...                       run valkey-cli on the current primary, e.g. cli main INFO memory
+  ssh <cluster> [node]                             open a shell on a node (default: the first one)
+  version                                          installed version
+  self-update                                      install the latest valkeyctl from GitHub
+
+State: ~/.valkeyctl/clusters/<cluster>.env and <cluster>-tls/ (override with VALKEYCTL_HOME).
 EOF
 }
 
@@ -102,7 +113,7 @@ wait_until() {
 
 require_local_tools() {
     local tool
-    for tool in ssh awk sed paste openssl; do
+    for tool in ssh awk sed paste openssl curl base64; do
         command -v "$tool" >/dev/null || die "$tool is required on this machine"
     done
 }
@@ -424,8 +435,25 @@ image_with_tag() {
     printf '%s:%s' "$repository" "$1"
 }
 
+running_from_checkout() {
+    [ "$REPO_DIR/ops/valkeyctl" -ef "$SCRIPT_PATH" ]
+}
+
+repo_file() {
+    running_from_checkout && { cat "$REPO_DIR/$1"; return; }
+    local cached="$SCRATCH/repo/$1"
+    if [ ! -s "$cached" ]; then
+        mkdir -p "$(dirname "$cached")"
+        curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPO/$VALKEYCTL_REF/$1" -o "$cached" \
+            || die "cannot download $1 from github.com/$GITHUB_REPO at $VALKEYCTL_REF"
+    fi
+    cat "$cached"
+}
+
 compose_for() {
-    sed -E "s|^([[:space:]]+image:).*|\1 $1|" "$REPO_DIR/compose.yaml"
+    local compose
+    compose=$(repo_file compose.yaml)
+    sed -E "s|^([[:space:]]+image:).*|\1 $1|" <<<"$compose"
 }
 
 inventory_variable_names() {
@@ -469,8 +497,11 @@ env_with() {
 
 provision() {
     local node=$1 env_content=$2
+    local setup compose
+    setup=$(repo_file host/setup)
+    compose=$(compose_for "$IMAGE")
     log "$node: installing Docker, tuning the host, writing $REMOTE_DIR and pulling $IMAGE"
-    on "$node" SETUP="$(cat "$REPO_DIR/host/setup")" COMPOSE="$(compose_for "$IMAGE")" ENV_CONTENT="$env_content" IMAGE="$IMAGE" <<'EOS'
+    on "$node" SETUP="$setup" COMPOSE="$compose" ENV_CONTENT="$env_content" IMAGE="$IMAGE" <<'EOS'
 export DEBIAN_FRONTEND=noninteractive
 if ! docker compose version >/dev/null 2>&1 || ! docker buildx version >/dev/null 2>&1; then
     apt-get update -q </dev/null
@@ -670,6 +701,7 @@ create_inventory() {
     printf '\n%s\n\n' "$(printf '%s\n' "$answers" | grep -v '^S3_SECRET_ACCESS_KEY=')" >&2
     ask_yes "Write this to $INVENTORY" y || die "aborted, nothing written"
     mkdir -p "$CLUSTERS_DIR"
+    chmod 700 "$CLUSTERS_DIR"
     tmp=$(mktemp "$INVENTORY.XXXXXX")
     printf '%s\n' "$answers" > "$tmp"
     chmod 600 "$tmp"
@@ -883,9 +915,10 @@ pull_image_on() {
 }
 
 upgrade_node() {
-    local node=$1 image=$2
+    local node=$1 image=$2 compose
+    compose=$(compose_for "$image")
     log "$node: writing compose.yaml for $image and recreating changed containers"
-    on "$node" COMPOSE="$(compose_for "$image")" <<'EOS'
+    on "$node" COMPOSE="$compose" <<'EOS'
 write_file "$VALKEY_DIR/compose.yaml" 644 "$COMPOSE"
 compose up -d
 EOS
@@ -1266,6 +1299,85 @@ cmd_backup_now() {
     run_on_primary "${1:-}" backup
 }
 
+cmd_list() {
+    local file found=false
+    for file in "$CLUSTERS_DIR"/*.env; do
+        [ -e "$file" ] || continue
+        found=true
+        (
+            # shellcheck disable=SC1090
+            source "$file"
+            printf '%-16s %s node(s)  %s\n' "$(basename "$file" .env)" "$(wc -w <<<"${NODES:-}" | tr -d ' ')" "${TLS_NAMES:-}"
+        )
+    done
+    [ "$found" = true ] || log "no clusters in $CLUSTERS_DIR yet, create one with: valkeyctl init <name>"
+}
+
+connection_host() {
+    local names
+    read -r -a names <<<"$TLS_NAMES"
+    [ "${#names[@]}" -gt 0 ] && { printf '%s' "${names[0]}"; return; }
+    public_ip_of "$(first_node)"
+}
+
+base64_of() {
+    base64 <"$1" | tr -d '\n'
+}
+
+require_local_file() {
+    [ -s "$TLS_LOCAL_DIR/$1" ] || die "$TLS_LOCAL_DIR/$1 is missing, run: valkeyctl init $CLUSTER"
+}
+
+cmd_env() {
+    load_inventory "${1:-}"
+    [ -n "$VALKEY_PASSWORD" ] || die "no password yet, run: valkeyctl init $CLUSTER"
+    require_local_file ca.crt
+    printf 'REDIS_CLIENT=phpredis\nREDIS_SCHEME=tls\nREDIS_HOST=%s\nREDIS_PORT=6380\nREDIS_PASSWORD=%s\n' "$(connection_host)" "$VALKEY_PASSWORD"
+    printf 'REDIS_TLS_CA_B64=%s\n' "$(base64_of "$TLS_LOCAL_DIR/ca.crt")"
+    [ "${TLS_CLIENT_VERIFY:-required}" = required ] || return 0
+    require_local_file client.crt
+    require_local_file client.key
+    printf 'REDIS_TLS_CERT_B64=%s\n' "$(base64_of "$TLS_LOCAL_DIR/client.crt")"
+    printf 'REDIS_TLS_KEY_B64=%s\n' "$(base64_of "$TLS_LOCAL_DIR/client.key")"
+}
+
+cmd_certs() {
+    load_inventory "${1:-}"
+    local destination=${2:-.} file
+    for file in ca.crt client.crt client.key; do
+        require_local_file "$file"
+    done
+    mkdir -p "$destination"
+    for file in ca.crt client.crt client.key; do
+        cp "$TLS_LOCAL_DIR/$file" "$destination/$file"
+    done
+    chmod 600 "$destination/client.key"
+    log "copied ca.crt, client.crt and client.key to $(cd "$destination" && pwd)"
+}
+
+cmd_cli() {
+    preflight "${1:-}"
+    shift
+    [ "$#" -gt 0 ] || die "usage: valkeyctl cli <cluster> <command>..."
+    on "$(primary_node)" ARGS="$(printf '%q ' "$@")" <<<'eval "vcli $ARGS"'
+}
+
+cmd_ssh() {
+    load_inventory "${1:-}"
+    local node=${2:-$(first_node)}
+    has_node "$node" || die "unknown node $node, known: $(node_names | paste -sd ' ' -)"
+    ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$(public_ip_of "$node")"
+}
+
+cmd_version() {
+    printf 'valkeyctl %s (github.com/%s)\n' "$VALKEYCTL_REF" "$GITHUB_REPO"
+}
+
+cmd_self_update() {
+    curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPO/main/install.sh" \
+        | VALKEYCTL_INSTALL_DIR="$(dirname "$SCRIPT_PATH")" sh
+}
+
 main() {
     local arguments=() argument
     for argument in "$@"; do
@@ -1280,7 +1392,7 @@ main() {
     local command=${1:-help}
     shift || true
     case "$command" in
-        init | status | add-node | remove-node | replace-node | failover | upgrade | rotate-certs | test-failover | backup-now)
+        init | status | add-node | remove-node | replace-node | failover | upgrade | rotate-certs | test-failover | backup-now | list | env | certs | cli | ssh | version | self-update)
             "cmd_${command//-/_}" "$@"
             ;;
         help | -h | --help) usage ;;

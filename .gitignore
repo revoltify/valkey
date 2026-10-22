@@ -3,6 +3,3 @@
 /data/
 /sentinel/
 /tls/
-/ops/clusters/*.env
-/ops/clusters/*-tls/
-/ops/clusters/.*.lock/

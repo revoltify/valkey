@@ -133,6 +133,20 @@ Every node runs the backup loop, but only the current primary uploads, so backup
 
 Replicas protect against a dead server, not against bad writes. A `FLUSHALL` or a buggy deploy reaches every replica within milliseconds. The S3 backups are the way back from those.
 
+## valkeyctl
+
+One command on your own machine sets up and runs a cluster over SSH, with no checkout of this repository:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/revoltify/valkey/main/install.sh | sh
+```
+
+```bash
+valkeyctl init main
+```
+
+`init` asks for single or HA mode, the servers, TLS and backups, then installs everything. Afterwards: `status`, `add-node`, `remove-node`, `replace-node`, `failover`, `upgrade`, `rotate-certs`, `test-failover`, `backup-now`, `env` (Laravel `.env` lines), `certs` (copy the client certificates to the current folder), `cli`, `ssh`, `list`, `self-update`. State lives in `~/.valkeyctl/clusters/`. See [DEPLOY.md](DEPLOY.md) for the full walkthrough.
+
 ## Deploy
 
 Step-by-step for DigitalOcean droplets behind a load balancer: [DEPLOY.md](DEPLOY.md). The steps below are the provider-neutral version.
