@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+[ "$(id -u)" = "0" ] || { echo "run as root" >&2; exit 1; }
+
+cat > /etc/sysctl.d/99-valkey.conf <<'EOF'
+vm.overcommit_memory = 1
+net.core.somaxconn = 1024
+EOF
+sysctl --system > /dev/null
+
+cat > /etc/systemd/system/disable-thp.service <<'EOF'
+[Unit]
+Description=Disable transparent huge pages for Valkey
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled && echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now disable-thp.service
+
+echo "overcommit_memory=$(cat /proc/sys/vm/overcommit_memory) thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled)"

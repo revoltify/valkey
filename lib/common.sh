@@ -57,6 +57,19 @@ distinct_characters_in() {
     printf '%s' "$1" | fold -w 1 | sort -u | wc -l | tr -d ' '
 }
 
+validate_password() {
+    require_env VALKEY_PASSWORD
+    require_matching VALKEY_PASSWORD '[A-Za-z0-9_-]{32,}' 'VALKEY_PASSWORD must be at least 32 characters of A-Z a-z 0-9 _ -'
+    [ "$(distinct_characters_in "$VALKEY_PASSWORD")" -ge 10 ] || fail "VALKEY_PASSWORD is too predictable, generate one with: openssl rand -hex 32"
+}
+
+drop_privileges() {
+    [ "$(id -u)" = "0" ] || return 0
+    [ "$(stat -c %U "$DATA_DIR")" = "valkey" ] || chown -R valkey:valkey "$DATA_DIR"
+    chmod 700 "$DATA_DIR"
+    exec su-exec valkey "$@"
+}
+
 validate_backup_env() {
     s3_require_env
     require_integer_at_least BACKUP_INTERVAL_SECONDS 60
@@ -69,8 +82,16 @@ valkey_ping() {
     valkey-cli PING 2>/dev/null | grep -q '^PONG'
 }
 
+info_field() {
+    valkey-cli INFO "$1" | tr -d '\r' | sed -n "s/^$2://p"
+}
+
 persistence_field() {
-    valkey-cli INFO persistence | tr -d '\r' | sed -n "s/^$1://p"
+    info_field persistence "$1"
+}
+
+is_primary() {
+    [ "$(info_field replication role)" = "master" ]
 }
 
 total_keys() {

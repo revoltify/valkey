@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/valkey-backup/common.sh
+. /usr/local/lib/valkey-backup/topology.sh
+
+: "${PRIMARY_PROBE_PORT:=8080}"
+
+drop_privileges "$0" "$@"
+
+validate_password
+validate_topology_env
+require_integer_at_least PRIMARY_PROBE_PORT 1
+
+log "answering 200 on $VALKEY_PRIVATE_IP:$PRIMARY_PROBE_PORT while this node is the primary"
+exec socat -T 5 "TCP-LISTEN:$PRIMARY_PROBE_PORT,bind=$VALKEY_PRIVATE_IP,fork,reuseaddr" EXEC:primary-status

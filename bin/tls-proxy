@@ -1,0 +1,83 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/valkey-backup/common.sh
+. /usr/local/lib/valkey-backup/topology.sh
+
+TLS_DIR=/tls
+PROXY_CONF=/tmp/haproxy.cfg
+
+: "${TLS_PROXY_PORT:=6380}"
+: "${TLS_CLIENT_VERIFY:=required}"
+: "${PRIMARY_PROBE_PORT:=8080}"
+
+drop_privileges "$0" "$@"
+
+validate_env() {
+    validate_topology_env
+    require_integer_at_least TLS_PROXY_PORT 1
+    require_integer_at_least PRIMARY_PROBE_PORT 1
+    case "$TLS_CLIENT_VERIFY" in
+        required | none) ;;
+        *) fail "TLS_CLIENT_VERIFY must be required or none" ;;
+    esac
+    for file in server.pem ca.crt; do
+        [ -r "$TLS_DIR/$file" ] || fail "$TLS_DIR/$file is missing or unreadable, create it with generate-certs"
+    done
+}
+
+own_address() {
+    [ "$VALKEY_PRIVATE_IP" = "0.0.0.0" ] && { printf '127.0.0.1'; return; }
+    printf '%s' "$VALKEY_PRIVATE_IP"
+}
+
+proxy_targets() {
+    sentinel_enabled && { sentinel_hosts; return; }
+    own_address
+}
+
+backend_servers() {
+    for host in $(proxy_targets); do
+        printf '    server node-%s %s:%s check port %s\n' "$host" "$host" "$VALKEY_PORT" "$PRIMARY_PROBE_PORT"
+    done
+}
+
+write_config() {
+    cat > "$PROXY_CONF" <<EOF
+global
+    log stdout format raw local0
+    ssl-default-bind-options ssl-min-ver TLSv1.2
+
+defaults
+    mode tcp
+    log global
+    option tcplog
+    option dontlognull
+    option clitcpka
+    option srvtcpka
+    timeout connect 3s
+    timeout check 2s
+    timeout client 1h
+    timeout server 1h
+
+frontend valkey_tls
+    bind :$TLS_PROXY_PORT ssl crt $TLS_DIR/server.pem ca-file $TLS_DIR/ca.crt verify $TLS_CLIENT_VERIFY
+    default_backend valkey_primary
+
+backend valkey_primary
+    option httpchk
+    http-check send meth GET uri /
+    http-check expect status 200
+    default-server inter 1s fall 2 rise 2 on-marked-down shutdown-sessions
+$(backend_servers)
+EOF
+}
+
+main() {
+    validate_env
+    write_config
+    log "TLS on :$TLS_PROXY_PORT (client certificates $TLS_CLIENT_VERIFY), routing to the primary among: $(proxy_targets | tr '\n' ' ')"
+    exec haproxy -db -f "$PROXY_CONF"
+}
+
+main

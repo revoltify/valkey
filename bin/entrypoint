@@ -3,22 +3,18 @@ set -eu
 
 . /usr/local/lib/valkey-backup/common.sh
 . /usr/local/lib/valkey-backup/tuning.sh
+. /usr/local/lib/valkey-backup/topology.sh
 
 VALKEY_CONF=/usr/local/etc/valkey/valkey.conf
 RUNTIME_CONF=/tmp/runtime.conf
 STARTING_MARKER=/tmp/valkey-starting
 AOF_MANIFEST="$DATA_DIR/appendonlydir/appendonly.aof.manifest"
 
-if [ "$(id -u)" = "0" ]; then
-    [ "$(stat -c %U "$DATA_DIR")" = "valkey" ] || chown -R valkey:valkey "$DATA_DIR"
-    chmod 700 "$DATA_DIR"
-    exec su-exec valkey "$0" "$@"
-fi
+drop_privileges "$0" "$@"
 
 validate_env() {
-    require_env VALKEY_PASSWORD
-    require_matching VALKEY_PASSWORD '[A-Za-z0-9_-]{32,}' 'VALKEY_PASSWORD must be at least 32 characters of A-Z a-z 0-9 _ -'
-    [ "$(distinct_characters_in "$VALKEY_PASSWORD")" -ge 10 ] || fail "VALKEY_PASSWORD is too predictable, generate one with: openssl rand -hex 32"
+    validate_password
+    validate_topology_env
     require_boolean BACKUP_ENABLED
     require_boolean RESTORE_ON_EMPTY
     require_integer_at_least VALKEY_MAXMEMORY_PERCENT 1
@@ -33,6 +29,7 @@ write_runtime_conf() {
     umask 077
     {
         printf '%s\n' "$tuned"
+        topology_directives "$1"
         env_directives
         printf 'requirepass "%s"\n' "$VALKEY_PASSWORD"
     } > "$RUNTIME_CONF"
@@ -65,6 +62,11 @@ restore_from_backup() {
     [ "$status" -eq 0 ] && return 0
     [ "$status" -eq 2 ] && return 1
     fail "restore failed, refusing to start with empty data"
+}
+
+startup_mode() {
+    [ "$1" = "$VALKEY_PRIVATE_IP" ] || { printf 'replica'; return; }
+    boot_mode
 }
 
 boot_mode() {
@@ -134,11 +136,12 @@ after_start() {
 main() {
     touch "$STARTING_MARKER"
     validate_env
-    write_runtime_conf
     clean_leftovers
 
-    mode=$(boot_mode)
-    log "boot mode: $mode"
+    primary=$(primary_address)
+    write_runtime_conf "$primary"
+    mode=$(startup_mode "$primary")
+    log "boot mode: $mode, primary: $primary"
 
     set -- "$VALKEY_CONF" --include "$RUNTIME_CONF"
     [ "$mode" = "rdb" ] && set -- "$@" --appendonly no

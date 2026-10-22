@@ -75,5 +75,5 @@ env_directives() {
 
 reserved_env_directives() {
     env_directives | awk '{ print $1 }' \
-        | grep -xE 'port|dir|dbfilename|appendfilename|appenddirname|requirepass|include|daemonize|unixsocket|logfile'
+        | grep -xE 'port|dir|dbfilename|appendfilename|appenddirname|requirepass|include|daemonize|unixsocket|logfile|bind|replicaof|slaveof|replica-announce-ip|masterauth|masteruser'
 }

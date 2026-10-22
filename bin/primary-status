@@ -1,0 +1,20 @@
+#!/bin/sh
+
+. /usr/local/lib/valkey-backup/common.sh
+
+drain_request() {
+    while IFS= read -r line; do
+        [ -z "$(printf '%s' "$line" | tr -d '\r')" ] && return 0
+    done
+}
+
+respond() {
+    printf 'HTTP/1.1 %s\r\nContent-Type: text/plain\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' "$1" "${#2}" "$2"
+}
+
+drain_request
+if is_primary; then
+    respond '200 OK' 'primary'
+    exit 0
+fi
+respond '503 Service Unavailable' 'not primary'

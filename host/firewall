@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+TLS_PROXY_PORT=${TLS_PROXY_PORT:-6380}
+
+[ "$(id -u)" = "0" ] || { echo "run as root" >&2; exit 1; }
+[ "$#" -ge 1 ] || { echo "usage: firewall <peer-public-ip>..." >&2; exit 1; }
+
+command -v ufw > /dev/null || { apt-get update -qq && apt-get install -y -qq ufw > /dev/null; }
+
+ufw default deny incoming > /dev/null
+ufw default allow outgoing > /dev/null
+ufw allow 22/tcp > /dev/null
+ufw allow "$TLS_PROXY_PORT/tcp" > /dev/null
+ufw allow in on wg0 > /dev/null
+for peer in "$@"; do
+    ufw allow from "$peer" to any port 51820 proto udp > /dev/null
+done
+ufw --force enable > /dev/null
+ufw status verbose

@@ -1,0 +1,60 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/valkey-backup/common.sh
+
+CERT_DIR=/certs
+CA_DAYS=3650
+LEAF_DAYS=825
+VALKEY_UID=999
+
+[ "$#" -ge 1 ] || fail "usage: generate-certs <hostname-or-ip>... (every name clients use to reach the TLS port)"
+
+subject_alt_names() {
+    for name in "$@"; do
+        case "$name" in
+            *[!0-9.]*) printf 'DNS:%s\n' "$name" ;;
+            *) printf 'IP:%s\n' "$name" ;;
+        esac
+    done | paste -sd ',' -
+}
+
+new_key() {
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1" 2>/dev/null
+    chmod 600 "$1"
+}
+
+create_ca() {
+    [ -s ca.key ] && return 0
+    new_key ca.key
+    openssl req -x509 -new -key ca.key -sha256 -days "$CA_DAYS" -subj "/CN=Valkey CA" -out ca.crt
+    log "created ca.crt"
+}
+
+issue() {
+    name=$1
+    extensions=$2
+    [ -s "$name.crt" ] && { log "$name.crt exists, keeping it"; return 0; }
+    new_key "$name.key"
+    printf '%s\n' "$extensions" > "$name.ext"
+    openssl req -new -key "$name.key" -subj "/CN=valkey-$name" \
+        | openssl x509 -req -CA ca.crt -CAkey ca.key -CAcreateserial -days "$LEAF_DAYS" -sha256 -extfile "$name.ext" -out "$name.crt" 2>/dev/null
+    rm -f "$name.ext"
+    log "issued $name.crt"
+}
+
+main() {
+    cd "$CERT_DIR"
+    create_ca
+    issue server "subjectAltName=$(subject_alt_names "$@")
+extendedKeyUsage=serverAuth
+keyUsage=digitalSignature"
+    issue client "extendedKeyUsage=clientAuth
+keyUsage=digitalSignature"
+    cat server.crt server.key > server.pem
+    chmod 600 server.pem
+    chown "$VALKEY_UID" server.pem ca.crt
+    log "done: give ca.crt, client.crt and client.key to the app; keep ca.key offline"
+}
+
+main "$@"

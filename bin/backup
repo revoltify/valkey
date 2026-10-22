@@ -63,6 +63,7 @@ prune_old_backups() {
 
 main() {
     validate_backup_env
+    is_primary || { log "not the primary, skipping backup"; return 0; }
     acquire_lock
 
     keys=$(total_keys)

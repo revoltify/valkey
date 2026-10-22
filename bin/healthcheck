@@ -2,7 +2,7 @@
 
 [ -e /tmp/valkey-starting ] && exit 0
 
-case "$(VALKEYCLI_AUTH="${VALKEY_PASSWORD:-}" valkey-cli PING 2>&1)" in
+case "$(VALKEYCLI_AUTH="${VALKEY_PASSWORD:-}" valkey-cli -p "${1:-6379}" PING 2>&1)" in
     PONG | LOADING*) exit 0 ;;
     *) exit 1 ;;
 esac
