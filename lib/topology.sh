@@ -3,6 +3,7 @@
 VALKEY_PORT=6379
 SENTINEL_PORT=26379
 SENTINEL_TIMEOUT_SECONDS=3
+FAILOVER_MINIMUM_NODES=3
 IPV4_PATTERN='([0-9]{1,3}\.){3}[0-9]{1,3}'
 
 : "${SENTINEL_MASTER_NAME:=main}"
@@ -62,12 +63,17 @@ bind_addresses() {
     printf '%s 127.0.0.1' "$VALKEY_PRIVATE_IP"
 }
 
+required_replicas_for() {
+    [ "$1" -ge "$FAILOVER_MINIMUM_NODES" ] && { printf '1'; return; }
+    printf '0'
+}
+
 topology_directives() {
     printf 'bind %s\n' "$(bind_addresses)"
     sentinel_enabled || return 0
     printf 'replica-announce-ip %s\n' "$VALKEY_PRIVATE_IP"
     printf 'masterauth "%s"\n' "$VALKEY_PASSWORD"
-    printf 'min-replicas-to-write 1\n'
+    printf 'min-replicas-to-write %s\n' "$(required_replicas_for "$(sentinel_hosts | wc -l)")"
     printf 'min-replicas-max-lag 10\n'
     [ "$1" = "$VALKEY_PRIVATE_IP" ] || printf 'replicaof %s %s\n' "$1" "$VALKEY_PORT"
 }
