@@ -8,6 +8,7 @@
 - [Preparing Your Servers](#preparing-your-servers)
 - [Creating a Cluster](#creating-a-cluster)
     - [Single Server or High Availability](#single-server-or-high-availability)
+    - [Read-Only Replicas](#read-only-replicas)
 - [Connecting Laravel](#connecting-laravel)
     - [Using Your Own Domain](#using-your-own-domain)
     - [Without Client Certificates](#without-client-certificates)
@@ -111,6 +112,18 @@ A **single server** is the simplest start, but it has no failover: restarting it
 | 2 | no failures (a live copy, but no automatic failover) |
 | 3 | 1 failure |
 | 5 | 2 failures |
+
+<a name="read-only-replicas"></a>
+### Read-Only Replicas
+
+A read-only replica follows the primary like any other server and votes in Sentinel, but is never promoted. Mark it in its own `.env` with `VALKEY_CONFIG_REPLICA_PRIORITY=0` (it must not be `VALKEY_INITIAL_PRIMARY`), and list every read-only server's private IP on **all** servers:
+
+```ini
+READ_REPLICA_HOSTS=10.104.0.4,10.104.0.5
+TLS_READ_PORT=6381
+```
+
+Each server's proxy then also accepts TLS on `TLS_READ_PORT` (default `6381`) and balances connections round-robin across the read-only replicas whose link to the primary is up. If none is available, reads fall back to the healthy standby replicas, and then to the primary. Port `6380` keeps routing to the primary. Open `6381` in your firewall the same way as `6380`.
 
 <a name="connecting-laravel"></a>
 ## Connecting Laravel

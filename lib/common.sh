@@ -94,6 +94,11 @@ is_primary() {
     [ "$(info_field replication role)" = "master" ]
 }
 
+is_synced_replica() {
+    replication=$(valkey-cli INFO replication | tr -d '\r')
+    printf '%s\n' "$replication" | grep -qx 'role:slave' && printf '%s\n' "$replication" | grep -qx 'master_link_status:up'
+}
+
 total_keys() {
     valkey-cli INFO keyspace | tr -d '\r' | sed -n 's/^db[0-9]*:keys=\([0-9]*\).*/\1/p' | awk '{ total += $1 } END { print total + 0 }'
 }

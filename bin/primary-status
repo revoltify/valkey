@@ -2,6 +2,11 @@
 
 . /usr/local/lib/valkey-backup/common.sh
 
+request_path() {
+    IFS=' ' read -r _ path _
+    printf '%s' "$path" | tr -d '\r'
+}
+
 drain_request() {
     while IFS= read -r line; do
         [ -z "$(printf '%s' "$line" | tr -d '\r')" ] && return 0
@@ -12,9 +17,14 @@ respond() {
     printf 'HTTP/1.1 %s\r\nContent-Type: text/plain\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' "$1" "${#2}" "$2"
 }
 
+answer() {
+    "$1" && { respond '200 OK' "$2"; return; }
+    respond '503 Service Unavailable' "not $2"
+}
+
+path=$(request_path)
 drain_request
-if is_primary; then
-    respond '200 OK' 'primary'
-    exit 0
-fi
-respond '503 Service Unavailable' 'not primary'
+case "$path" in
+    /replica) answer is_synced_replica 'replica' ;;
+    *) answer is_primary 'primary' ;;
+esac

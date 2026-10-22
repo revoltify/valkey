@@ -17,15 +17,34 @@ sentinel_enabled() {
 validate_topology_env() {
     require_env VALKEY_PRIVATE_IP
     require_matching VALKEY_PRIVATE_IP "$IPV4_PATTERN" 'VALKEY_PRIVATE_IP must be an IPv4 address'
+    validate_read_only_env
     sentinel_enabled || return 0
-    require_matching SENTINEL_HOSTS "$IPV4_PATTERN(,$IPV4_PATTERN)*" 'SENTINEL_HOSTS must be comma-separated IPv4 addresses without spaces'
+    require_ipv4_list SENTINEL_HOSTS
     require_matching SENTINEL_MASTER_NAME '[A-Za-z0-9_-]+'
     require_integer_at_least SENTINEL_QUORUM 1
     require_boolean VALKEY_INITIAL_PRIMARY
 }
 
+read_only_node() {
+    [ "${VALKEY_CONFIG_REPLICA_PRIORITY:-}" = "0" ]
+}
+
+validate_read_only_env() {
+    read_only_node || return 0
+    sentinel_enabled || fail "a read-only node (VALKEY_CONFIG_REPLICA_PRIORITY=0) needs SENTINEL_HOSTS to find its primary"
+    [ "$VALKEY_INITIAL_PRIMARY" = "false" ] || fail "a read-only node (VALKEY_CONFIG_REPLICA_PRIORITY=0) cannot be VALKEY_INITIAL_PRIMARY"
+}
+
+require_ipv4_list() {
+    require_matching "$1" "$IPV4_PATTERN(,$IPV4_PATTERN)*" "$1 must be comma-separated IPv4 addresses without spaces"
+}
+
+hosts_in() {
+    printf '%s\n' "$1" | tr ',' '\n'
+}
+
 sentinel_hosts() {
-    printf '%s\n' "$SENTINEL_HOSTS" | tr ',' '\n'
+    hosts_in "$SENTINEL_HOSTS"
 }
 
 first_sentinel_host() {
