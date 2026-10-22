@@ -62,7 +62,7 @@ main() {
 
     printf 'installed valkeyctl %s to %s/valkeyctl\n' "$(printf '%s' "$commit" | cut -c1-12)" "$dir"
     on_path "$dir" || printf "add %s to your PATH, e.g.: echo 'export PATH=\"%s:\$PATH\"' >> ~/.zshrc\n" "$dir" "$dir"
-    printf 'next: valkeyctl init <cluster-name>\n'
+    printf 'next: valkeyctl init <cluster-name>   (remove later with: valkeyctl uninstall)\n'
 }
 
 main

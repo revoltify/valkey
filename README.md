@@ -145,11 +145,11 @@ curl -fsSL https://raw.githubusercontent.com/revoltify/valkey/main/install.sh | 
 valkeyctl init main
 ```
 
-`init` asks for single or HA mode, the servers, TLS and backups, then installs everything. Afterwards: `status`, `add-node`, `remove-node`, `replace-node`, `failover`, `upgrade`, `rotate-certs`, `test-failover`, `backup-now`, `env` (Laravel `.env` lines), `certs` (copy the client certificates to the current folder), `cli`, `ssh`, `list`, `self-update`. State lives in `~/.valkeyctl/clusters/`. See [DEPLOY.md](DEPLOY.md) for the full walkthrough.
+`init` asks for single or HA mode, the servers, TLS and backups, then installs everything. Afterwards: `status`, `add-node`, `remove-node`, `replace-node`, `failover`, `upgrade`, `rotate-certs`, `test-failover`, `backup-now`, `env` (Laravel `.env` lines), `certs` (copy the client certificates to the current folder), `cli`, `ssh`, `list`, `self-update`, `uninstall` (`--purge` also deletes `~/.valkeyctl`). State lives in `~/.valkeyctl/clusters/`; run `valkeyctl help` for details.
 
 ## Deploy
 
-Step-by-step for DigitalOcean droplets behind a load balancer: [DEPLOY.md](DEPLOY.md). The steps below are the provider-neutral version.
+`valkeyctl` automates the steps below; they are kept for manual setups.
 
 Works on any VPS with Docker (DigitalOcean, OVH, Hetzner…). Use Ubuntu 24.04 or Debian 12 with at least 2 GB RAM, ideally in the region closest to your app. Copy this repository's `host/` folder plus `compose.yaml` and `.env.example` to each server, e.g. `/srv/valkey`.
 

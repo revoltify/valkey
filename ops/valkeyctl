@@ -45,6 +45,7 @@ usage: valkeyctl [--yes] <command> <cluster> [arguments]
   ssh <cluster> [node]                             open a shell on a node (default: the first one)
   version                                          installed version
   self-update                                      install the latest valkeyctl from GitHub
+  uninstall [--purge]                              remove the valkeyctl command (--purge also deletes ~/.valkeyctl)
 
 State: ~/.valkeyctl/clusters/<cluster>.env and <cluster>-tls/ (override with VALKEYCTL_HOME).
 EOF
@@ -74,7 +75,7 @@ create_scratch_dir() {
 }
 
 confirm() {
-    printf '\nPlan for cluster %s:\n' "$CLUSTER" >&2
+    printf '\nPlan%s:\n' "${CLUSTER:+ for cluster $CLUSTER}" >&2
     printf '  - %s\n' "$@" >&2
     [ "$YES" = true ] && return 0
     local answer
@@ -1378,6 +1379,35 @@ cmd_self_update() {
         | VALKEYCTL_INSTALL_DIR="$(dirname "$SCRIPT_PATH")" sh
 }
 
+remove_installed_command() {
+    if [ -w "$(dirname "$SCRIPT_PATH")" ]; then
+        rm -f "$SCRIPT_PATH"
+        return
+    fi
+    log "$(dirname "$SCRIPT_PATH") is not writable, using sudo"
+    sudo rm -f "$SCRIPT_PATH"
+}
+
+cmd_uninstall() {
+    running_from_checkout && die "this valkeyctl runs from a repository checkout, there is nothing to uninstall"
+    local purge=false
+    case "${1:-}" in
+        "") ;;
+        --purge) purge=true ;;
+        *) die "usage: valkeyctl uninstall [--purge]" ;;
+    esac
+    if [ "$purge" = true ]; then
+        confirm "remove $SCRIPT_PATH" "DELETE $STATE_DIR: every cluster's password, CA key and client certificates (the servers keep running)"
+    else
+        confirm "remove $SCRIPT_PATH" "keep $STATE_DIR (cluster passwords and certificates), delete it yourself or use --purge"
+    fi
+    remove_installed_command
+    log "removed $SCRIPT_PATH"
+    [ "$purge" = true ] || return 0
+    rm -rf "$STATE_DIR"
+    log "deleted $STATE_DIR"
+}
+
 main() {
     local arguments=() argument
     for argument in "$@"; do
@@ -1392,7 +1422,7 @@ main() {
     local command=${1:-help}
     shift || true
     case "$command" in
-        init | status | add-node | remove-node | replace-node | failover | upgrade | rotate-certs | test-failover | backup-now | list | env | certs | cli | ssh | version | self-update)
+        init | status | add-node | remove-node | replace-node | failover | upgrade | rotate-certs | test-failover | backup-now | list | env | certs | cli | ssh | version | self-update | uninstall)
             "cmd_${command//-/_}" "$@"
             ;;
         help | -h | --help) usage ;;
