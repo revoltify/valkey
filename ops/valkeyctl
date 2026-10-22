@@ -24,6 +24,7 @@ usage() {
 usage: valkeyctl [--yes] <command> <cluster> [arguments]
 
   init <cluster>                                   provision every node in the inventory and start the group
+                                                   (asks for mode, servers, TLS and backups when no inventory exists)
   status <cluster>                                 roles, replication, memory, containers, Sentinel and TLS
   add-node <cluster> <name> <public>/<private>     join a new replica
   remove-node <cluster> <name>                     retire a replica (keeps its data directory)
@@ -106,13 +107,17 @@ require_local_tools() {
     done
 }
 
-load_inventory() {
+select_cluster() {
     [ -n "${1:-}" ] || { usage >&2; exit 2; }
     [[ $1 =~ ^[A-Za-z0-9_-]+$ ]] || die "cluster name must be letters, digits, _ or -"
     CLUSTER=$1
     INVENTORY="$CLUSTERS_DIR/$CLUSTER.env"
     TLS_LOCAL_DIR="$CLUSTERS_DIR/$CLUSTER-tls"
-    [ -f "$INVENTORY" ] || die "no inventory at $INVENTORY"
+}
+
+load_inventory() {
+    select_cluster "${1:-}"
+    [ -f "$INVENTORY" ] || die "no inventory at $INVENTORY, run: valkeyctl init $CLUSTER"
     # shellcheck disable=SC1090
     source "$INVENTORY"
     SSH_USER=${SSH_USER:-root}
@@ -134,8 +139,16 @@ validate_nodes() {
     [ "$(private_ips | sort -u | wc -l)" -eq "$(node_count)" ] || die "duplicate private IPs in NODES"
 }
 
+valid_node_name() {
+    [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]]
+}
+
+valid_ipv4() {
+    [[ $1 =~ ^$IPV4$ ]]
+}
+
 validate_node_name() {
-    [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "node name '$1' must be lowercase letters, digits and -"
+    valid_node_name "$1" || die "node name '$1' must be lowercase letters, digits and -"
 }
 
 validate_address() {
@@ -533,7 +546,140 @@ ensure_password() {
     log "generated VALKEY_PASSWORD and stored it in $INVENTORY"
 }
 
+ask() {
+    local prompt=$1 default=${2:-} answer
+    read -r -p "$prompt${default:+ [$default]}: " answer || die "no answer, run init in a terminal"
+    printf '%s' "${answer:-$default}"
+}
+
+ask_secret() {
+    local answer
+    read -r -s -p "$1: " answer || die "no answer, run init in a terminal"
+    printf '\n' >&2
+    printf '%s' "$answer"
+}
+
+ask_valid() {
+    local prompt=$1 default=$2 check=$3 problem=$4 answer
+    while true; do
+        answer=$(ask "$prompt" "$default")
+        "$check" "$answer" && { printf '%s' "$answer"; return 0; }
+        printf '  %s\n' "$problem" >&2
+    done
+}
+
+ask_yes() {
+    local answer
+    answer=$(ask "$1 (y/n)" "$2")
+    [[ $answer =~ ^[Yy] ]]
+}
+
+valid_mode() {
+    [[ $1 =~ ^(single|ha)$ ]]
+}
+
+valid_group_size() {
+    [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -ge "$FAILOVER_MINIMUM_NODES" ]
+}
+
+valid_tls_names() {
+    local name
+    for name in $1; do
+        [[ $name =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    done
+}
+
+valid_https_url() {
+    [[ $1 =~ ^https://[^[:space:]]+$ ]]
+}
+
+valid_word() {
+    [[ $1 =~ ^[A-Za-z0-9._/+=-]+$ ]]
+}
+
+valid_interval() {
+    [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -ge 60 ]
+}
+
+node_count_for_mode() {
+    [ "$1" = single ] && { printf '1'; return; }
+    ask_valid "How many servers (3 or more, odd numbers survive more failures)" 3 valid_group_size "enter $FAILOVER_MINIMUM_NODES or more"
+}
+
+ask_node() {
+    local index=$1 name public private
+    printf '\nServer %s\n' "$index" >&2
+    name=$(ask_valid "  name" "$(printf 'valkey-%02d' "$index")" valid_node_name "lowercase letters, digits and -")
+    public=$(ask_valid "  public IP (for SSH)" "" valid_ipv4 "enter an IPv4 address")
+    private=$(ask_valid "  private VPC IP" "" valid_ipv4 "enter an IPv4 address")
+    printf '%s=%s/%s' "$name" "$public" "$private"
+}
+
+public_ips_in() {
+    local entry address
+    for entry in $1; do
+        address=${entry#*=}
+        printf '%s\n' "${address%%/*}"
+    done | paste -sd ' ' -
+}
+
+inventory_line() {
+    [[ $2 =~ [\"\$\`\\] ]] && { printf '%s=%q\n' "$1" "$2"; return; }
+    printf '%s="%s"\n' "$1" "$2"
+}
+
+backup_lines() {
+    if ! ask_yes "Back up to S3-compatible storage" n; then
+        inventory_line BACKUP_ENABLED false
+        return 0
+    fi
+    inventory_line BACKUP_ENABLED true
+    inventory_line S3_ENDPOINT "$(ask_valid "  S3 endpoint" "https://sg-s3.storage.bunnycdn.com" valid_https_url "must start with https://")"
+    inventory_line S3_REGION "$(ask_valid "  S3 region" "sg" valid_word "letters, digits and -")"
+    inventory_line S3_BUCKET "$(ask_valid "  bucket (Bunny: storage zone name)" "" valid_word "letters, digits, . and -")"
+    inventory_line S3_ACCESS_KEY_ID "$(ask_valid "  access key (Bunny: storage zone name)" "" valid_word "letters, digits and ./+=-")"
+    inventory_line S3_SECRET_ACCESS_KEY "$(ask_secret "  secret key (hidden)")"
+    inventory_line BACKUP_INTERVAL_SECONDS "$(ask_valid "  seconds between backups" 3600 valid_interval "60 or more")"
+}
+
+inventory_answers() {
+    local mode count index nodes='' entry
+    printf 'No inventory for cluster %s yet, answer a few questions (Enter keeps the [default]).\n\n' "$CLUSTER" >&2
+    mode=$(ask_valid "Mode: single (1 server, no failover) or ha (3+ servers, automatic failover)" ha valid_mode "type single or ha")
+    count=$(node_count_for_mode "$mode")
+    for index in $(seq 1 "$count"); do
+        entry=$(ask_node "$index")
+        nodes="${nodes:+$nodes }$entry"
+    done
+    printf '\n' >&2
+    inventory_line NODES "$nodes"
+    inventory_line SSH_USER "$(ask "SSH user" root)"
+    inventory_line IMAGE "$(ask "Image" "$DEFAULT_IMAGE")"
+    inventory_line TLS_NAMES "$(ask_valid "Names clients use for TLS port 6380: load balancer IP/hostname, space separated" "$(public_ips_in "$nodes")" valid_tls_names "IPs or hostnames separated by spaces")"
+    if ask_yes "Require client certificates (mutual TLS)" y; then
+        inventory_line TLS_CLIENT_VERIFY required
+    else
+        inventory_line TLS_CLIENT_VERIFY none
+    fi
+    backup_lines
+}
+
+create_inventory() {
+    local answers tmp
+    answers=$(inventory_answers)
+    printf '\n%s\n\n' "$(printf '%s\n' "$answers" | grep -v '^S3_SECRET_ACCESS_KEY=')" >&2
+    ask_yes "Write this to $INVENTORY" y || die "aborted, nothing written"
+    mkdir -p "$CLUSTERS_DIR"
+    tmp=$(mktemp "$INVENTORY.XXXXXX")
+    printf '%s\n' "$answers" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$INVENTORY"
+    log "wrote $INVENTORY"
+}
+
 cmd_init() {
+    select_cluster "${1:-}"
+    [ -f "$INVENTORY" ] || create_inventory
     preflight "${1:-}"
     local first node
     first=$(first_node)
