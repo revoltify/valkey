@@ -14,6 +14,7 @@ services:
     <<: *node
     volumes:
       - ./data:/data
+      - ./.env:/etc/node.env:ro
     stop_grace_period: 30s
     ulimits:
       nofile: 65535
@@ -21,6 +22,8 @@ services:
   probe:
     <<: *node
     entrypoint: [/sbin/tini, --, primary-probe]
+    volumes:
+      - ./.env:/etc/node.env:ro
     healthcheck:
       disable: true
 
@@ -28,6 +31,7 @@ services:
     <<: *node
     entrypoint: [/sbin/tini, --, tls-proxy]
     volumes:
+      - ./.env:/etc/node.env:ro
       - ./tls:/tls:ro
       - ./acme:/acme
     ulimits:
@@ -41,6 +45,7 @@ services:
     entrypoint: [/sbin/tini, --, sentinel-entrypoint]
     volumes:
       - ./sentinel:/data
+      - ./.env:/etc/node.env:ro
     healthcheck:
       test: [CMD, healthcheck, "26379"]
       interval: 15s

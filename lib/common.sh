@@ -1,5 +1,19 @@
 #!/bin/sh
 
+NODE_ENV_FILE=/etc/node.env
+
+load_node_env() {
+    [ -r "$NODE_ENV_FILE" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in *=*) ;; *) continue ;; esac
+        key=${line%%=*}
+        case "$key" in '' | [0-9]* | *[!A-Za-z0-9_]*) continue ;; esac
+        export "$key=${line#*=}"
+    done < "$NODE_ENV_FILE"
+}
+
+load_node_env
+
 DATA_DIR=/data
 BACKUP_PATH="${BACKUP_PATH:-valkey}"
 BACKUP_PATH_PATTERN='[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*'
