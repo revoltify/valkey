@@ -343,7 +343,7 @@ remote_variables() {
 on() {
     local node=$1
     shift
-    { remote_prelude; remote_variables "$@"; cat; } | ssh_to "$node" 'bash -c "$(cat)"'
+    { remote_prelude; remote_variables "$@"; cat; } | ssh_to "$node" 'script=$(mktemp); cat > "$script"; bash "$script" </dev/null; status=$?; rm -f "$script"; exit $status'
 }
 
 run_on() {

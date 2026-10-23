@@ -73,8 +73,12 @@ wait_for_known_primary() {
 primary_address() {
     sentinel_enabled || { printf '%s' "$VALKEY_PRIVATE_IP"; return; }
     known_primary && return
-    [ "$VALKEY_INITIAL_PRIMARY" = "true" ] && { printf '%s' "$VALKEY_PRIVATE_IP"; return; }
+    [ "$VALKEY_INITIAL_PRIMARY" = "true" ] && ! has_local_data && { printf '%s' "$VALKEY_PRIVATE_IP"; return; }
     wait_for_known_primary
+}
+
+has_local_data() {
+    [ -s "$DATA_DIR/dump.rdb" ] || [ -d "$DATA_DIR/appendonlydir" ]
 }
 
 bind_addresses() {
